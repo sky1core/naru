@@ -1,0 +1,9 @@
+*.md
+!README.md
+
+.*
+!.gitignore
+
+node_modules/
+dist/
+artifacts/
