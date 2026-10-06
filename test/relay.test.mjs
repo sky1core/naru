@@ -82,7 +82,7 @@ async function launch(profile, url, evidence, entry = '.') {
       if (output.split('\n').some((line) => line.startsWith('{"event":"ready"'))) { clearTimeout(timer); resolveReady(); }
     });
     child.once('error', (error) => { clearTimeout(timer); reject(error); });
-    child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`Electron exited ${code}\n${errors}`)); });
+    child.once('close', (code) => { clearTimeout(timer); reject(new Error(`Electron exited ${code}\n${errors}`)); });
   });
   const call = await connect(profile);
   return { call, async stop() {
@@ -222,6 +222,22 @@ test('real Electron, API, CLI, persistent profile, and safe failure contracts', 
     assert.equal((await stat(join(profile, 'connection.json'))).mode & 0o777, 0o600);
     const cli = await exec(process.execPath, ['src/cli.mjs', '--profile', profile, 'snapshot']);
     assert.equal(JSON.parse(cli.stdout).documentId, documentId);
+  });
+
+  await t.test('the same or another profile cannot start a second app or replace the running page', async () => {
+    for (const candidate of [join(evidence, 'another-profile'), profile]) {
+      let duplicate;
+      try {
+        await assert.rejects(async () => {
+          duplicate = await launch(candidate, `${url}another`, evidence);
+        }, /Electron exited 1\n[\s\S]*Naru is already running\./);
+        const after = await call('/v1/status');
+        assert.equal(after.documentId, documentId);
+        assert.equal(after.url, url);
+      } finally {
+        if (duplicate) await duplicate.stop();
+      }
+    }
   });
 
   const sendId = randomUUID();
@@ -420,6 +436,96 @@ test('pointer activation can complete without a synthesized click', async () => 
     assert.equal(opened.result.text, 'open');
   } finally {
     if (app) await app.stop();
+    await new Promise(done => server.close(done));
+  }
+});
+
+test('background input and review collection keep another window focused', { timeout: 20000 }, async () => {
+  await mkdir('artifacts/test-runs', { recursive: true });
+  const evidence = await mkdtemp(resolve('artifacts/test-runs/background-'));
+  const profile = join(evidence, 'profile');
+  const focusPath = join(evidence, 'focus.json');
+  const projectId = 'g-p-0123456789abcdef0123456789abcdef';
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'text/html' });
+    response.end(`<!doctype html><div data-app-action-sidebar-project-id="${projectId}"></div>
+<form><textarea id="prompt-textarea"></textarea><button data-testid="send-button">Send</button></form>
+<button id="rewind">Earlier</button><pre id="key"></pre><pre id="sent-trust"></pre><div id="history" data-app-action-timeline-scroll style="height:100px;overflow:auto"><div style="height:600px"></div><div id="messages"></div></div>
+<script>
+const editor=document.getElementById('prompt-textarea'),scroller=document.getElementById('history');
+scroller.scrollTop=scroller.scrollHeight;
+editor.onkeydown=e=>document.getElementById('key').textContent=e.key+':'+e.isTrusted;
+document.getElementById('rewind').onclick=()=>{scroller.scrollTop=0};
+document.querySelector('form').onsubmit=e=>{
+ e.preventDefault();document.getElementById('sent-trust').textContent=String(e.isTrusted);const prompt=editor.value;editor.value='';const id=prompt.match(/Review request UUID: ([a-f0-9-]+)/)[1];
+ history.replaceState(null,'','/g/${projectId}/c/'+id);
+ for(const [role,text] of [['user',prompt],['assistant','answer\\nEND-OF-REVIEW:'+id]]){
+  const section=document.createElement('section'),body=document.createElement('div');
+  section.dataset.testid='conversation-turn-'+role;body.dataset.messageId=role+'-'+id;body.dataset.messageAuthorRole=role;body.style.whiteSpace='pre-wrap';body.textContent=text;section.append(body);
+  if(role==='assistant'){const copy=document.createElement('button');copy.dataset.testid='copy-turn-action-button';copy.textContent='Copy';section.append(copy)}
+  document.getElementById('messages').append(section);
+ }
+ scroller.scrollTop=scroller.scrollHeight;
+};
+</script>`);
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const entry = join(evidence, 'background.mjs');
+  await writeFile(entry, `import { app, BrowserWindow } from 'electron';
+import { writeFileSync, renameSync } from 'node:fs';
+app.once('browser-window-created', (_event, primary) => {
+  let other, focuses = 0;
+  const record = () => {
+    writeFileSync(${JSON.stringify(focusPath + '.tmp')}, JSON.stringify({ focuses, otherFocused: other !== undefined && !other.isDestroyed() && other.isFocused(), primaryFocused: !primary.isDestroyed() && primary.isFocused() }));
+    renameSync(${JSON.stringify(focusPath + '.tmp')}, ${JSON.stringify(focusPath)});
+  };
+  primary.on('focus', () => { focuses++; record(); });
+  primary.on('blur', record);
+  primary.once('ready-to-show', async () => {
+    other = new BrowserWindow({ show: false, width: 1300, height: 1000 });
+    other.on('focus', record);
+    other.on('blur', record);
+    await other.loadURL('data:text/html,<textarea autofocus>Other work</textarea>');
+    other.show(); other.focus();
+  });
+});
+await import(${JSON.stringify(new URL('../src/main.mjs', import.meta.url).href)});
+`);
+  let running;
+  try {
+    const url = `http://127.0.0.1:${server.address().port}/g/${projectId}/project`;
+    running = await launch(profile, url, evidence, entry);
+    let focus;
+    const deadline = Date.now() + 5000;
+    do {
+      try { focus = JSON.parse(await readFile(focusPath, 'utf8')); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (focus?.otherFocused && !focus.primaryFocused) break;
+      await delay(20);
+    } while (Date.now() < deadline);
+    assert.equal(focus?.otherFocused, true);
+    assert.equal(focus.primaryFocused, false);
+    let duplicate;
+    try {
+      await assert.rejects(async () => { duplicate = await launch(profile, url, evidence); }, /Electron exited 1\n[\s\S]*Naru is already running\./);
+    } finally { if (duplicate) await duplicate.stop(); }
+    const run = async command => (await running.call('/v1/commands', { id: randomUUID(), deadlineMs: 5000, command })).result;
+    const current = async (action, value, extra = {}) => run({ action, documentId: (await running.call('/v1/status')).documentId, target: { attribute: 'id', value }, ...extra });
+    await run({ action: 'project.bind', documentId: (await running.call('/v1/status')).documentId });
+    const review = await run({ action: 'review.prepare', reviewId: randomUUID(), question: 'Read in the background.', files: [] });
+    await run({ action: 'review.submit', reviewId: review.id, documentId: (await running.call('/v1/status')).documentId });
+    assert.equal((await current('read', 'sent-trust')).text, 'true');
+    await current('click', 'rewind');
+    assert.equal((await running.call('/v1/review-ui')).historyAtLatest, false);
+    assert.equal((await run({ action: 'review.collect', reviewId: review.id, waitMs: 2000 })).state, 'completed');
+    await current('press', 'prompt-textarea', { key: 'Enter' });
+    assert.equal((await current('read', 'key')).text, 'Enter:true');
+    const after = JSON.parse(await readFile(focusPath, 'utf8'));
+    assert.equal(after.focuses, focus.focuses);
+    assert.equal(after.otherFocused, true);
+    assert.equal(after.primaryFocused, false);
+  } finally {
+    if (running) await running.stop();
     await new Promise(done => server.close(done));
   }
 });

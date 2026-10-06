@@ -147,8 +147,6 @@ export class Browser {
     signal?.addEventListener('abort', abort, { once: true });
     let result;
     try {
-      this.window.focus();
-      this.contents.focus();
       result = await this.contents.executeJavaScriptInIsolatedWorld(999, [
         { code: `(${inspectChatGPT.toString()})(${JSON.stringify({ action: 'scroll-history', direction, url, anchorId, token })}, (${inspectDOM.toString()}))` },
       ]);
@@ -347,6 +345,10 @@ export class Browser {
       });
     }
     try {
+      if (inputCommand) {
+        this.assertDocument(documentId);
+        await this.contents.debugger.sendCommand('Emulation.setFocusEmulationEnabled', { enabled: true });
+      }
       if (waitCommand) signal?.addEventListener('abort', cancelOperation, { once: true });
       const prepared = await this.dom({ ...command, token, deadlineAt, documentURL: this.contents.getURL() }, documentId, signal);
       if (command.action === 'fill') {
@@ -356,8 +358,6 @@ export class Browser {
       if (!inputCommand) return { documentId, ...prepared };
       this.assertActive(signal);
       this.assertDocument(documentId);
-      this.window.focus();
-      this.contents.focus();
       if (beforeDispatch) beforeDispatch();
       diagnostic.stage = 'dispatching';
       if (command.action === 'click') {

@@ -44,14 +44,15 @@ if (values.help) {
   const initialURL = values.url !== undefined ? values.url : project !== null ? project.url : 'https://chatgpt.com/';
   if (!isWebURL(initialURL)) throw new Error('Initial URL must be HTTP(S) without credentials.');
   app.setName('Naru');
-  app.setPath('userData', profile);
-  app.setPath('sessionData', join(profile, 'chromium'));
+  app.setPath('userData', prepareProfile(join(app.getPath('appData'), 'Naru')));
   if (!app.requestSingleInstanceLock()) {
-    console.error('An instance already owns this profile.');
+    console.error('Naru is already running.');
     app.exit(1);
   } else {
+    app.setPath('userData', profile);
+    app.setPath('sessionData', join(profile, 'chromium'));
     app.whenReady().then(async () => {
-    const preferences = { sandbox: true, contextIsolation: true, nodeIntegration: false, nodeIntegrationInSubFrames: true, webSecurity: true,
+    const preferences = { sandbox: true, contextIsolation: true, nodeIntegration: false, nodeIntegrationInSubFrames: true, webSecurity: true, backgroundThrottling: false,
       preload: fileURLToPath(new URL('./input-guard.cjs', import.meta.url)) };
     const window = new BrowserWindow({ width: 1180, height: 820, title: 'Naru', webPreferences: preferences });
     const browser = new Browser(window);
@@ -96,7 +97,6 @@ if (values.help) {
         { role: 'reload' }, { role: 'togglefullscreen' },
       ] },
     ]));
-    app.on('second-instance', () => { window.show(); window.focus(); });
     app.on('window-all-closed', () => app.quit());
     window.on('closed', () => app.quit());
     const { server, descriptor } = await startServer({ browser, profile, quit: () => app.quit() });

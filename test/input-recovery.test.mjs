@@ -72,7 +72,9 @@ test('an expired native dispatch stays unsettled until the browser acknowledges 
   const dispatch = Promise.withResolvers();
   const entered = Promise.withResolvers();
   let settled = false;
-  contents.debugger.sendCommand = () => { entered.resolve(); return dispatch.promise; };
+  contents.debugger.sendCommand = async (method) => {
+    if (method.startsWith('Input.')) { entered.resolve(); await dispatch.promise; }
+  };
   const outcome = browser.execute({ action: 'click', documentId: browser.documentId,
     target: { attribute: 'id', value: 'control' } }, controller.signal, Date.now() + 1000)
     .then(result => ({ result }), error => ({ error })).finally(() => { settled = true; });
@@ -97,7 +99,7 @@ test('an expired native dispatch stays unsettled until the browser acknowledges 
 test('the public API accepts the next command after a missing receipt times out without replaying input', async () => {
   const { browser, contents, receipt, entered, cancelled } = setup();
   let inputs = 0;
-  contents.debugger.sendCommand = async () => { inputs++; };
+  contents.debugger.sendCommand = async (method) => { if (method.startsWith('Input.')) inputs++; };
   const profile = await mkdtemp(join(tmpdir(), 'naru-input-recovery-'));
   const { server, descriptor } = await startServer({ browser, profile, quit() {} });
   writePrivateJSON(join(profile, 'connection.json'), descriptor);

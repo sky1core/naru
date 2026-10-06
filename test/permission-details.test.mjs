@@ -20,6 +20,7 @@ async function mainFixture(profile, mainURL, serverURL, scenario) {
   const app = new EventEmitter();
   Object.assign(app, {
     setName() {}, setPath(key, value) { paths.set(key, value); },
+    getPath(key) { assert.equal(key, 'appData'); return profile + '/app-data'; },
     requestSingleInstanceLock: () => true, whenReady: () => Promise.resolve(),
     exit(code) { exits.push(code); ready.resolve(false); },
     quit() { app.emit('will-quit'); },
