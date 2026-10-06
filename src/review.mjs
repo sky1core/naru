@@ -581,7 +581,7 @@ export class Reviews {
         if (record.startURL !== before.url && !sameConversation(record.startURL, before.url)) {
           throw new RelayError('conversation_changed', 'The prepared draft is outside its recorded conversation.');
         }
-        before = await this.browser.reviewView(signal, record.baselineIds, deadlineAt);
+        before = await this.readRecordedHistory(record, before, signal, deadlineAt, true);
         this.assertBaseline(record, before.messages);
         if (previous) this.assertPrevious(previous, before);
       } else if (previous) {
@@ -735,9 +735,9 @@ export class Reviews {
       await this.browser.navigateReview(record.conversationURL, view, signal, deadlineAt);
       view = await this.browser.reviewView(signal);
     }
-    view = await this.readRecordedHistory(record, view, signal, deadlineAt, false);
     while (true) {
       this.browser.assertActive(signal);
+      view = await this.readRecordedHistory(record, view, signal, deadlineAt, false);
       let observed;
       if (view.busy) {
         const found = this.identifyRequest(record, view);
@@ -758,7 +758,6 @@ export class Reviews {
         retryAfterMs: candidate ? Math.max(1, Math.ceil(600 - view.stableForMs)) : 30000 } };
       await this.browser.waitReviewChange(view, Math.min(remaining, candidate ? 600 - view.stableForMs : remaining), signal);
       view = await this.browser.reviewView(signal);
-      if (!view.busy) view = await this.browser.reviewView(signal, historyIds(record), deadlineAt);
     }
   }
 }

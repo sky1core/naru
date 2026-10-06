@@ -342,3 +342,113 @@ test('multipart and follow-up use the same conversation through Electron and CLI
   });
   console.log('Continuation evidence: '+evidence);
 });
+
+test('history readiness is preserved during collection and draft resumption', { timeout: 30000 }, async t => {
+  await mkdir('artifacts/continuation-runs', { recursive: true });
+  const evidence = await mkdtemp(resolve('artifacts/continuation-runs/recovery-'));
+  const profile = join(evidence, 'profile');
+  let shiftResponse, historyResponse, restoredDraft = null;
+  const shiftReady = Promise.withResolvers(), historyReady = Promise.withResolvers();
+  const server = createServer((request, response) => {
+    if (request.url === '/shift-history') { shiftResponse = response; shiftReady.resolve(); return; }
+    if (request.url === '/restore-history') { historyResponse = response; historyReady.resolve(); return; }
+    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    response.end(fixture.replace('</script>', `
+      const fills=document.createElement('pre');fills.id='fills';fills.textContent='0';document.body.append(fills);
+      editor.addEventListener('input',()=>fills.textContent=String(Number(fills.textContent)+1));
+      const prepare=document.createElement('button');prepare.id='prepare-shift';prepare.textContent='Prepare';document.body.append(prepare);
+      prepare.onclick=()=>{
+        const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.textContent='Generating';document.body.append(stop);
+        fetch('/shift-history').then(r=>r.text()).then(()=>{
+          document.getElementById('older-window').click();
+          setTimeout(()=>stop.remove(),250);
+        });
+      };
+      if(conversation&&${JSON.stringify(restoredDraft)}!==null){
+        editor.value=${JSON.stringify(restoredDraft)};historyScroller.remove();
+        fetch('/restore-history').then(r=>r.text()).then(()=>document.body.append(historyScroller));
+      }
+    </script>`));
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const home = `http://127.0.0.1:${server.address().port}/g/${projectId}/project`;
+  let app;
+  t.after(async () => {
+    shiftResponse?.end(); historyResponse?.end();
+    try { if (app) await app.stop(); }
+    finally { await new Promise(done => server.close(done)); }
+  });
+  app = await launch(profile, home, evidence);
+  const call = app.call;
+  const run = async command => (await call('/v1/commands', { id: randomUUID(), deadlineMs: 6000, command })).result;
+  const current = async (action, value) => run({ action, documentId: (await call('/v1/status')).documentId,
+    target: { attribute: 'id', value } });
+  const submit = async record => run({ action: 'review.submit', reviewId: record.id, documentId: (await call('/v1/status')).documentId });
+  const collect = async record => run({ action: 'review.collect', reviewId: record.id, waitMs: 4000 });
+  const prepare = async (question, previous) => run({ action: 'review.prepare', reviewId: randomUUID(), question, files: [],
+    ...(previous ? { continueFrom: { reviewId: previous.id, promptHash: previous.promptHash, answerHash: previous.answerHash } } : {}) });
+  await run({ action: 'project.bind', documentId: (await call('/v1/status')).documentId });
+
+  await t.test('collection recovers a request that leaves the viewport while waiting for generation', async () => {
+    const parent = await collect(await submit(await prepare('PARENT')));
+    const record = await submit(await prepare('CHILD', parent));
+    const sent = (await current('read', 'count')).text;
+    await current('click', 'prepare-shift'); await shiftReady.promise;
+    const id = randomUUID();
+    const pending = call('/v1/commands', { id, deadlineMs: 6000,
+      command: { action: 'review.collect', reviewId: record.id, waitMs: 4000 } })
+      .then(response => ({ result: response.result }), error => ({ error }));
+    try {
+      const deadline = Date.now() + 2000;
+      while ((await call('/v1/status')).execution?.requestId !== id) {
+        assert(Date.now() < deadline, 'Collection did not begin.'); await delay(10);
+      }
+      const before = await call('/v1/review-ui');
+      assert.equal(before.busy, true);
+      assert(before.messages.some(message => message.id === record.userMessageId));
+      shiftResponse.end('shift');
+      const completed = await pending;
+      assert.equal(completed.error, undefined);
+      assert.equal(completed.result.state, 'completed');
+      assert.match(completed.result.answer, /PARENT \| CHILD/);
+      assert.equal((await current('read', 'count')).text, sent);
+    } finally { shiftResponse.end(); await pending; }
+  });
+
+  await t.test('an exact failed draft waits for its history container without refilling or resending', async () => {
+    await run({ action: 'navigate', url: home });
+    const parent = await collect(await submit(await prepare('DRAFT-PARENT')));
+    await current('click', 'cover');
+    const record = await prepare('DRAFT-CHILD', parent);
+    await assert.rejects(submit(record), { code: 'target_obscured' });
+    const failed = await call(`/v1/reviews/${record.id}`);
+    assert.equal(failed.state, 'failed'); assert.equal(failed.sendAttemptedAt, undefined);
+    const before = await call('/v1/review-ui');
+    restoredDraft = before.draft;
+    const sent = Number((await current('read', 'count')).text);
+    await run({ action: 'navigate', url: before.url }); await historyReady.promise;
+    const loading = await call('/v1/review-ui');
+    assert.equal(loading.draft, restoredDraft);
+    assert.equal(loading.historyScrollable, false);
+    const id = randomUUID();
+    const pending = call('/v1/commands', { id, deadlineMs: 6000,
+      command: { action: 'review.submit', reviewId: record.id, documentId: (await call('/v1/status')).documentId } })
+      .then(response => ({ result: response.result }), error => ({ error }));
+    try {
+      const deadline = Date.now() + 2000;
+      while ((await call('/v1/status')).execution?.requestId !== id) {
+        assert(Date.now() < deadline, 'Draft submission did not begin.'); await delay(10);
+      }
+      const waiting = await call('/v1/review-ui');
+      assert.equal(waiting.historyScrollable, false);
+      assert.equal(waiting.draft, restoredDraft);
+      historyResponse.end('ready');
+      const resumed = await pending;
+      assert.equal(resumed.error, undefined);
+      assert.equal(resumed.result.state, 'submitted');
+      assert.equal((await current('read', 'fills')).text, '0');
+      assert.equal(Number((await current('read', 'count')).text), sent + 1);
+      assert.equal((await collect(record)).state, 'completed');
+    } finally { historyResponse.end(); await pending; restoredDraft = null; }
+  });
+});

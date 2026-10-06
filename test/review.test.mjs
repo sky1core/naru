@@ -417,8 +417,13 @@ test('review workflow through the real Electron API and CLI against an isolated 
   for (const mode of ['replace-message', 'leave-conversation']) {
     await t.test(`${mode} cannot replace the bound review message`, async () => {
       await navigate(mode); const review = await prepare(); await submit(review.id);
-      await assert.rejects(collect(review.id), { code: 'conversation_changed' });
+      const sent = await count();
+      await assert.rejects(call('/v1/commands', { id: randomUUID(), deadlineMs: 1500,
+        command: { action: 'review.collect', reviewId: review.id, waitMs: 2500 } }),
+      { code: mode === 'leave-conversation' ? 'command_timeout' : 'conversation_changed' });
       assert.notEqual((await call(`/v1/reviews/${review.id}`)).state, 'completed');
+      await call('/v1/snapshot');
+      assert.equal(await count(), sent);
     });
   }
 
