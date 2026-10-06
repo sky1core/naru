@@ -60,7 +60,21 @@ test('multipart and follow-up use the same conversation through Electron and CLI
   await mkdir('artifacts/continuation-runs',{recursive:true});
   const evidence=await mkdtemp(resolve('artifacts/continuation-runs/run-'));
   const profile=join(evidence,'profile');
-  const server=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});res.end(fixture)});
+  let initialHistory = null;
+  const server=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});res.end(initialHistory
+    ? fixture.replace('</script>', `if(conversation){
+        if(${JSON.stringify(initialHistory)}==='busy-container'){
+          const parked=[...messages.childNodes];messages.replaceChildren();
+          const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.textContent='Generating';document.body.append(stop);
+          setTimeout(()=>{messages.append(...parked);setTimeout(()=>stop.remove(),100)},250);
+        }else{
+          historyScroller.remove();
+          const first=${JSON.stringify(initialHistory)}==='assistant-first'?messages.querySelector('[data-message-author-role="assistant"]').parentElement:null;
+          if(first)document.body.append(first);
+          setTimeout(()=>{if(first)messages.append(first);document.body.append(historyScroller)},250);
+        }
+      }</script>`)
+    : fixture)});
   server.listen(0,'127.0.0.1');await once(server,'listening');
   const origin=`http://127.0.0.1:${server.address().port}`;
   let app=await launch(profile,`${origin}/g/${projectId}/project`,evidence);
@@ -279,6 +293,31 @@ test('multipart and follow-up use the same conversation through Electron and CLI
     const sentFiles=JSON.parse((await run({action:'read',documentId:(await call('/v1/status')).documentId,target:{attribute:'id',value:'received-files'}})).text);
     assert.equal(sentFiles.length,1);assert.equal(sentFiles[0].content,'already sent material');
     assert.equal(Number(await count()),Number(before)+2);
+  });
+  await t.test('collection and continuation wait for history that appears after the composer', async () => {
+    for (const mode of ['complete-container', 'busy-container', 'assistant-first']) {
+      await home();
+      const question = `LOADING-HISTORY-${mode}`, out = join(evidence, `loading-history-${mode}.txt`);
+      await rejected(/review_pending/, 'ask', '--question', question, '--out', out, '--timeout', '0');
+      assert.equal((await record(out)).state, 'submitted');
+      const before = Number(await count());
+      await home();
+      initialHistory = mode;
+      try {
+        await cli('collect', '--out', out, '--timeout', '5000');
+        assert.equal((await record(out)).state, 'completed');
+        assert((await readFile(out, 'utf8')).includes(question));
+        assert.equal(Number(await count()), before);
+        if (mode !== 'busy-container') {
+          await home();
+          const next = `AFTER-LOADING-${mode}`, follow = await ask(next, '--continue-from', out);
+          assert((await readFile(follow, 'utf8')).includes(`${question} | ${next}`));
+          assert.equal(Number(await count()), before + 1);
+        }
+      } finally {
+        initialHistory = null;
+      }
+    }
   });
   console.log('Continuation evidence: '+evidence);
 });

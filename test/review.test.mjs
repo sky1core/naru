@@ -756,7 +756,7 @@ test('collect recovery after default restart preserves conversation identity and
   await t.test('reopened conversations still reject missing, replaced, changed and unrelated messages', async () => {
     const record = await submitted(); await click('finish'); const count = await read('count');
     const saved = await call(`/v1/reviews/${record.id}`);
-    for (const [change, code] of [['missing', 'conversation_changed'], ['identity', 'conversation_changed'], ['body', 'review_content_mismatch'],
+    for (const [change, code] of [['missing', 'command_timeout'], ['identity', 'conversation_changed'], ['body', 'review_content_mismatch'],
       ['baseline', 'conversation_changed'], ['interleaved', 'conversation_changed'], ['copied-route', 'conversation_changed'], ['redirect', 'conversation_changed'], ['project-redirect', 'project_changed']]) {
       await navigate(home); fault = change;
       await assert.rejects(collect(record.id), { code });

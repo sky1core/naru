@@ -9,7 +9,7 @@ export function inspectEffort(input) {
   const scopeNode = target => unique(target.scope ? scopeNode(target.scope) : document,
     `[${target.attribute}="${CSS.escape(target.value)}"]`, false);
   const triggerNode = () => {
-    const scope = scopeNode(input.trigger.scope);
+    const scope = input.trigger.scope ? scopeNode(input.trigger.scope) : document;
     return unique(scope, '[data-codex-intelligence-trigger="true"]');
   };
   const read = () => {

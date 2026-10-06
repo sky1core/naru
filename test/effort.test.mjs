@@ -17,7 +17,7 @@ const projectId = 'g-p-0123456789abcdef0123456789abcdef';
 const alternateProjectId = 'g-p-fedcba9876543210fedcba9876543210';
 const fixture = (mode) => `<!doctype html><meta charset="utf-8"><style>button,textarea,[role=menuitem]{padding:12px} [role=menu]{background:white;padding:20px} section{white-space:pre-wrap}</style>
 <div data-app-action-sidebar-project-id="${projectId}"></div>
-<form data-chatgpt-composer data-composer-placement="home"><textarea id="prompt-textarea"></textarea><button type="button" data-codex-intelligence-trigger="true" data-selected-reasoning-effort="medium" aria-expanded="false">任意文字</button><button type="submit" data-testid="send-button">번역</button></form><pre id="sent">${''}</pre><div id="messages"></div>
+<form ${mode === 'legacy' ? '' : 'data-chatgpt-composer data-composer-placement="home"'}><textarea id="prompt-textarea"></textarea><button type="button" data-codex-intelligence-trigger="true" data-selected-reasoning-effort="medium" aria-expanded="false">任意文字</button><button type="submit" data-testid="send-button">번역</button></form><pre id="sent">${''}</pre><div id="messages"></div>
 <script>
 const mode=${JSON.stringify(mode)};
 const threadMode=mode==='thread'||mode.startsWith('retained-');let activePage,inactivePage;
@@ -73,6 +73,16 @@ test('effort selection through real Electron and CLI', { timeout: 90000 }, async
   const submit = async (id, deadlineMs) => run({ action: 'review.submit', reviewId: id, documentId: (await call('/v1/status')).documentId }, deadlineMs);
   const sent = async () => (await run({ action: 'read', documentId: (await call('/v1/status')).documentId, target: { attribute: 'id', value: 'sent' } })).text;
   await run({ action: 'project.bind', documentId: (await call('/v1/status')).documentId });
+  await t.test('an unscoped composer selects and sends the requested Pro effort', async () => {
+    await navigate('legacy');
+    assert.deepEqual((await call('/v1/review-ui')).composer, { attribute: 'id', value: 'prompt-textarea' });
+    const record = await prepare('pro');
+    await submit(record.id);
+    assert.equal(await sent(), 'pro');
+    const result = await run({ action: 'review.collect', reviewId: record.id, waitMs: 1500 });
+    assert.equal(result.state, 'completed');
+    assert.equal(result.selectedEffort.effort, 'pro');
+  });
   await t.test('all semantic efforts select correctly even when slider order changes', async () => {
     for (const effort of ['none', 'medium', 'high', 'max', 'pro']) {
       await navigate('reordered');

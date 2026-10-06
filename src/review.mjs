@@ -504,7 +504,12 @@ export class Reviews {
         view = await this.browser.reviewView(signal);
         this.project.assertURL(project, view.url);
         if (view.problem) throw new RelayError(view.problem.code, view.problem.message);
-        if (view.composer) break;
+        if ((!sameConversation(previous.conversationURL, view.url) &&
+            !(previous.userMessageId && canonicalizesConversation(previous.conversationURL, view.url))) ||
+            (previous.userMessageId && requestMessages(previous, view.messages).some(message => message.id !== previous.userMessageId))) {
+          this.identifyRequest(previous, view);
+        }
+        if (view.composer && (view.historyScrollable || historyIds(previous).every(id => view.messages.some(message => message.id === id)))) break;
         const remaining = deadlineAt - Date.now();
         if (remaining <= 0) throw new RelayError('continuation_not_ready', 'The recorded conversation did not finish loading.');
         await this.browser.waitReviewChange(view, remaining, signal);
@@ -716,7 +721,15 @@ export class Reviews {
         view = await this.browser.reviewView(signal);
         this.project.assertURL(project, view.url);
         if (view.problem) throw new RelayError(view.problem.code, view.problem.message);
-        if (view.composer) break;
+        if ((!sameConversation(record.conversationURL, view.url) &&
+            !(record.userMessageId && canonicalizesConversation(record.conversationURL, view.url))) ||
+            (record.userMessageId && requestMessages(record, view.messages).some(message => message.id !== record.userMessageId))) {
+          this.identifyRequest(record, view);
+        }
+        if (view.composer && (view.historyScrollable || historyIds(record).every(id => view.messages.some(message => message.id === id)))) {
+          view = await this.browser.reviewView(signal, historyIds(record), deadlineAt);
+          break;
+        }
         const remaining = deadlineAt - Date.now();
         if (remaining <= 0) throw new RelayError('review_not_ready', 'The recorded conversation did not finish loading.');
         await this.browser.waitReviewChange(view, remaining, signal);
