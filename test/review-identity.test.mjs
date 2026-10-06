@@ -398,7 +398,7 @@ test('URL migration during generation defers missing viewport history until full
         historyReads.push(requiredIds);
       }
       const messages = requiredIds.length ? [...earlier, ...view.messages] : view.messages;
-      return { ...structuredClone(view), messages: structuredClone(messages), inputHistory: JSON.stringify(messages) };
+      return { ...structuredClone(view), historyScrollable: true, messages: structuredClone(messages), inputHistory: JSON.stringify(messages) };
     };
     view.busy = true;
     assert.equal((await reviews.collect(record.id, 0)).observation.state, 'generating');

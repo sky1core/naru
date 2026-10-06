@@ -331,7 +331,7 @@ test('submission binds the sent message without scanning old pages during genera
         else historyReadsAfterGeneration++;
       }
       const messages = requiredIds.length ? view.messages : view.messages.slice(-2);
-      return { ...structuredClone(view), messages: structuredClone(messages), inputHistory: JSON.stringify(messages) };
+      return { ...structuredClone(view), historyScrollable: true, messages: structuredClone(messages), inputHistory: JSON.stringify(messages) };
     };
     const sent = await reviews.submit(next.id, browser.status().documentId, undefined, Date.now() + 30000);
     assert.equal(sent.state, 'submitted');

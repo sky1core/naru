@@ -490,6 +490,35 @@ export class Reviews {
     return { userMessageId: user.id, conversationURL: view.url };
   }
 
+  async readRecordedHistory(record, view, signal, deadlineAt, requireComposer) {
+    while (true) {
+      this.browser.assertActive(signal);
+      if (view.problem) throw new RelayError(view.problem.code, view.problem.message);
+      if (record.project) this.project.assertURL(record.project, view.url);
+      if ((projectRoute(record.conversationURL)?.home === false && !sameConversation(record.conversationURL, view.url) &&
+          !(record.userMessageId && canonicalizesConversation(record.conversationURL, view.url))) ||
+          (record.userMessageId && requestMessages(record, view.messages).some(message => message.id !== record.userMessageId))) {
+        this.identifyRequest(record, view);
+      }
+      if ((!requireComposer || view.composer) && view.busy &&
+          (!record.userMessageId || view.messages.some(message => message.id === record.userMessageId))) return view;
+      const requiredIds = view.busy ? (record.userMessageId ? [record.userMessageId] : []) : historyIds(record);
+      const present = requiredIds.every(id => view.messages.some(message => message.id === id));
+      if ((!requireComposer || view.composer) && (view.historyScrollable || present)) {
+        const loaded = await this.browser.reviewView(signal, requiredIds, deadlineAt);
+        if (view.busy && !loaded.busy) {
+          view = loaded;
+          continue;
+        }
+        return loaded;
+      }
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) throw new RelayError('command_timeout', 'The recorded conversation did not finish loading before the deadline.', 504);
+      await this.browser.waitReviewChange(view, remaining, signal);
+      view = await this.browser.reviewView(signal);
+    }
+  }
+
   async openPrevious(previous, project, signal, deadlineAt) {
     if (!previous.project || previous.project.id !== project.id || previous.project.origin !== project.origin) {
       throw new RelayError('project_changed', 'Continuation belongs to a different bound project.');
@@ -500,24 +529,11 @@ export class Reviews {
       this.assertReady(view);
       this.project.assertURL(project, previous.conversationURL);
       await this.browser.navigateReview(previous.conversationURL, view, signal, deadlineAt);
-      while (true) {
-        view = await this.browser.reviewView(signal);
-        this.project.assertURL(project, view.url);
-        if (view.problem) throw new RelayError(view.problem.code, view.problem.message);
-        if ((!sameConversation(previous.conversationURL, view.url) &&
-            !(previous.userMessageId && canonicalizesConversation(previous.conversationURL, view.url))) ||
-            (previous.userMessageId && requestMessages(previous, view.messages).some(message => message.id !== previous.userMessageId))) {
-          this.identifyRequest(previous, view);
-        }
-        if (view.composer && (view.historyScrollable || historyIds(previous).every(id => view.messages.some(message => message.id === id)))) break;
-        const remaining = deadlineAt - Date.now();
-        if (remaining <= 0) throw new RelayError('continuation_not_ready', 'The recorded conversation did not finish loading.');
-        await this.browser.waitReviewChange(view, remaining, signal);
-      }
+      view = await this.browser.reviewView(signal);
     }
     this.project.assertURL(project, view.url);
     if (projectRoute(view.url)?.home) throw new RelayError('conversation_changed', 'Continuation requires the previous conversation, not a project home.');
-    view = await this.browser.reviewView(signal, historyIds(previous), deadlineAt);
+    view = await this.readRecordedHistory(previous, view, signal, deadlineAt, true);
     while (true) {
       this.assertReady(view);
       const binding = this.assertPrevious(previous, view);
@@ -717,24 +733,9 @@ export class Reviews {
       this.project.assertURL(project, record.conversationURL);
       this.assertReady(view);
       await this.browser.navigateReview(record.conversationURL, view, signal, deadlineAt);
-      while (true) {
-        view = await this.browser.reviewView(signal);
-        this.project.assertURL(project, view.url);
-        if (view.problem) throw new RelayError(view.problem.code, view.problem.message);
-        if ((!sameConversation(record.conversationURL, view.url) &&
-            !(record.userMessageId && canonicalizesConversation(record.conversationURL, view.url))) ||
-            (record.userMessageId && requestMessages(record, view.messages).some(message => message.id !== record.userMessageId))) {
-          this.identifyRequest(record, view);
-        }
-        if (view.composer && (view.historyScrollable || historyIds(record).every(id => view.messages.some(message => message.id === id)))) {
-          view = await this.browser.reviewView(signal, historyIds(record), deadlineAt);
-          break;
-        }
-        const remaining = deadlineAt - Date.now();
-        if (remaining <= 0) throw new RelayError('review_not_ready', 'The recorded conversation did not finish loading.');
-        await this.browser.waitReviewChange(view, remaining, signal);
-      }
+      view = await this.browser.reviewView(signal);
     }
+    view = await this.readRecordedHistory(record, view, signal, deadlineAt, false);
     while (true) {
       this.browser.assertActive(signal);
       let observed;
@@ -742,7 +743,6 @@ export class Reviews {
         const found = this.identifyRequest(record, view);
         observed = { ...found?.binding, state: 'generating' };
       } else {
-        view = await this.browser.reviewView(signal, historyIds(record), deadlineAt);
         observed = this.observation(record, view);
       }
       if (observed.userMessageId && (!record.userMessageId || record.conversationURL !== observed.conversationURL)) {
@@ -758,6 +758,7 @@ export class Reviews {
         retryAfterMs: candidate ? Math.max(1, Math.ceil(600 - view.stableForMs)) : 30000 } };
       await this.browser.waitReviewChange(view, Math.min(remaining, candidate ? 600 - view.stableForMs : remaining), signal);
       view = await this.browser.reviewView(signal);
+      if (!view.busy) view = await this.browser.reviewView(signal, historyIds(record), deadlineAt);
     }
   }
 }

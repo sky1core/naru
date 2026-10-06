@@ -56,22 +56,24 @@ async function launch(profile, url, evidence) {
 }
 
 
-test('multipart and follow-up use the same conversation through Electron and CLI', {timeout:120000}, async t => {
+test('multipart and follow-up use the same conversation through Electron and CLI', {timeout:180000}, async t => {
   await mkdir('artifacts/continuation-runs',{recursive:true});
   const evidence=await mkdtemp(resolve('artifacts/continuation-runs/run-'));
   const profile=join(evidence,'profile');
   let initialHistory = null;
+  let historyDelay = 250;
   const server=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});res.end(initialHistory
     ? fixture.replace('</script>', `if(conversation){
-        if(${JSON.stringify(initialHistory)}==='busy-container'){
+        if(['busy-container','busy-finishes-early'].includes(${JSON.stringify(initialHistory)})){
           const parked=[...messages.childNodes];messages.replaceChildren();
           const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.textContent='Generating';document.body.append(stop);
-          setTimeout(()=>{messages.append(...parked);setTimeout(()=>stop.remove(),100)},250);
+          setTimeout(()=>{messages.append(...parked.slice(-2));if(${JSON.stringify(initialHistory)}==='busy-finishes-early')stop.remove()},${historyDelay});
+          setTimeout(()=>{messages.prepend(...parked.slice(0,-2));stop.remove()},${historyDelay + 1500});
         }else{
           historyScroller.remove();
-          const first=${JSON.stringify(initialHistory)}==='assistant-first'?messages.querySelector('[data-message-author-role="assistant"]').parentElement:null;
+          const first=${JSON.stringify(initialHistory)}==='assistant-first'?[...messages.querySelectorAll('[data-message-author-role="assistant"]')].at(-1).parentElement:null;
           if(first)document.body.append(first);
-          setTimeout(()=>{if(first)messages.append(first);document.body.append(historyScroller)},250);
+          setTimeout(()=>{if(first)messages.append(first);document.body.append(historyScroller)},${historyDelay});
         }
       }</script>`)
     : fixture)});
@@ -79,7 +81,7 @@ test('multipart and follow-up use the same conversation through Electron and CLI
   const origin=`http://127.0.0.1:${server.address().port}`;
   let app=await launch(profile,`${origin}/g/${projectId}/project`,evidence);
   let call=app.call;
-  const run=async command=>(await call('/v1/commands',{id:randomUUID(),command})).result;
+  const run=async (command,deadlineMs)=>(await call('/v1/commands',{id:randomUUID(),command,deadlineMs})).result;
   t.after(async()=>{if(app)await app.stop();await new Promise(done=>server.close(done))});
   await run({action:'project.bind',documentId:(await call('/v1/status')).documentId});
   const cli=(...args)=>exec(process.execPath,['src/cli.mjs','--profile',profile,...args]);
@@ -295,27 +297,46 @@ test('multipart and follow-up use the same conversation through Electron and CLI
     assert.equal(Number(await count()),Number(before)+2);
   });
   await t.test('collection and continuation wait for history that appears after the composer', async () => {
-    for (const mode of ['complete-container', 'busy-container', 'assistant-first']) {
+    for (const sameURL of [true, false]) for (const mode of ['complete-container', 'busy-container', 'busy-finishes-early', 'assistant-first']) {
       await home();
-      const question = `LOADING-HISTORY-${mode}`, out = join(evidence, `loading-history-${mode}.txt`);
-      await rejected(/review_pending/, 'ask', '--question', question, '--out', out, '--timeout', '0');
-      assert.equal((await record(out)).state, 'submitted');
+      const question = `LOADING-HISTORY-${mode}-${sameURL}`, out = join(evidence, `loading-history-${mode}-${sameURL}.txt`);
+      const earlier = await ask(`BEFORE-${question}`);
+      await rejected(/review_pending/, 'ask', '--question', question, '--out', out, '--timeout', '0', '--continue-from', earlier);
+      const previous = await record(out);
+      assert.equal(previous.state, 'submitted');
+      assert(previous.baselineIds.length > 0);
       const before = Number(await count());
       await home();
       initialHistory = mode;
+      historyDelay = sameURL ? 1000 : 250;
+      const reopen = async () => {
+        await run({ action: 'navigate', url: previous.conversationURL });
+        const loading = await call('/v1/review-ui');
+        assert.equal(loading.url, previous.conversationURL);
+        assert(loading.composer);
+        assert(!loading.messages.some(message => message.id === previous.userMessageId));
+      };
       try {
+        if (sameURL) await reopen();
+        if (mode === 'busy-container') {
+          const pending = await run({ action: 'review.collect', reviewId: previous.id, waitMs: 0 }, 1500);
+          assert.equal(pending.observation.state, 'generating');
+          assert.equal(Number(await count()), before);
+        }
         await cli('collect', '--out', out, '--timeout', '5000');
         assert.equal((await record(out)).state, 'completed');
         assert((await readFile(out, 'utf8')).includes(question));
         assert.equal(Number(await count()), before);
-        if (mode !== 'busy-container') {
-          await home();
-          const next = `AFTER-LOADING-${mode}`, follow = await ask(next, '--continue-from', out);
+        if (!mode.startsWith('busy-')) {
+          if (sameURL) await reopen();
+          else await home();
+          const next = `AFTER-LOADING-${mode}-${sameURL}`, follow = await ask(next, '--continue-from', out);
           assert((await readFile(follow, 'utf8')).includes(`${question} | ${next}`));
           assert.equal(Number(await count()), before + 1);
         }
       } finally {
         initialHistory = null;
+        historyDelay = 250;
       }
     }
   });
