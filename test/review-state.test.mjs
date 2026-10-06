@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { Reviews } from '../src/review.mjs';
 import { Project } from '../src/project.mjs';
 import { Browser } from '../src/browser.mjs';
+import { encodeReviewPrompt, escapeReviewJSON } from '../src/review-files.mjs';
 
 const projectId = 'g-p-0123456789abcdef0123456789abcdef';
 const homeURL = `https://example.com/g/${projectId}/project`;
@@ -21,6 +22,7 @@ test('continuation navigation preserves a draft, attachment or generation that a
     assertDocument: id => assert.equal(id, documentId), assertActive() {},
     status: () => ({ documentId }), reviewView: async () => ({ ...structuredClone(view), inputHistory: JSON.stringify(view.messages) }),
     snapshot: async () => ({ elements: [{ attributes: { 'data-app-action-sidebar-project-id': projectId } }] }),
+    async navigateReview(url, _view, signal, deadlineAt) { return this.execute({ action: 'navigate', url }, signal, deadlineAt); },
     async execute(command, _signal, _deadlineAt, beforeDispatch) {
       if (command.action === 'navigate') view.url = command.url;
       if (command.action === 'fill') view.draft = command.text;
@@ -109,6 +111,7 @@ test('submission preserves an exact legacy or encoded draft and blocks a represe
     let reads = 0, fills = 0, clicks = 0, canonical, encoded;
     const browser = {
       assertDocument(id) { assert.equal(id, documentId); }, assertActive() {}, status: () => ({ documentId }),
+      async navigateReview(url, _view, signal, deadlineAt) { return this.execute({ action: 'navigate', url }, signal, deadlineAt); },
       snapshot: async () => ({ elements: [{ attributes: { 'data-app-action-sidebar-project-id': projectId } }] }),
       reviewView: async () => {
         reads++;
@@ -154,6 +157,82 @@ test('submission preserves an exact legacy or encoded draft and blocks a represe
       assert.equal(fills, kind === 'new-fill-swapped' ? 1 : 0);
       assert.equal(view.draft, kind === 'legacy-to-encoded' ? encoded : canonical);
       assert.equal(reviews.get(record.id).sendAttemptedAt, undefined);
+    }
+  }
+});
+
+test('Unicode transmission preserves every supported prepared draft and rejects swaps before sending', async () => {
+  const kinds = ['plain', 'fenced', 'unicode', 'unicode-fenced'];
+  const source = 'npm @scope/package https://source.example/(path) `literal` **bold** \\u0040 \\*\r\n한글🙂';
+  const hash = text => createHash('sha256').update(text).digest('hex');
+  for (const state of ['prepared', 'preparing', 'failed', 'uncertain']) {
+    for (const kind of kinds) {
+      if (state === 'prepared' && kind !== 'unicode-fenced') continue;
+      for (const swap of [false, true]) {
+        await mkdir('artifacts/review-state-runs', { recursive: true });
+        const profile = await mkdtemp(resolve('artifacts/review-state-runs/run-'));
+        const documentId = randomUUID();
+        const view = { url: homeURL, composer: { attribute: 'id', value: 'prompt-textarea' }, composerPlacement: null,
+          draft: '', attachments: false, busy: false, stableForMs: 1000, messages: [],
+          send: { attribute: 'data-testid', value: 'send-button' }, sendEnabled: true };
+        let reads = 0, fills = 0, clicks = 0, text, replacement;
+        const browser = {
+          assertDocument(id) { assert.equal(id, documentId); }, assertActive() {}, status: () => ({ documentId }),
+          snapshot: async () => ({ elements: [{ attributes: { 'data-app-action-sidebar-project-id': projectId } }] }),
+          async navigateReview(url) { view.url = url; },
+          reviewView: async () => {
+            reads++;
+            if (swap && reads === 2) view.draft = replacement;
+            return { ...structuredClone(view), inputHistory: JSON.stringify(view.messages) };
+          },
+          async execute(command, _signal, _deadlineAt, beforeDispatch) {
+            if (command.action === 'fill') { fills++; view.draft = command.text; }
+            if (command.action === 'click') {
+              assert.equal(command.expectedText.text, text);
+              assert.equal(view.draft, text);
+              beforeDispatch?.(); clicks++;
+              const id = view.draft.match(/Review request UUID: ([a-f0-9-]+)/)[1];
+              view.messages.push({ id: 'user-' + id, role: 'user', text: view.draft, error: '', complete: false });
+              view.draft = ''; view.url = `https://example.com/g/${projectId}/c/${id}`;
+            }
+          },
+        };
+        await new Project(profile, browser).bind(documentId);
+        const reviews = new Reviews(profile, browser);
+        const record = reviews.prepare({ reviewId: randomUUID(), question: 'Review exact material', files: [
+          { path: 'source.txt', content: source, sha256: hash(source), bytes: Buffer.byteLength(source) },
+        ] });
+        const unicode = escapeReviewJSON(record.prompt);
+        const variants = { plain: record.prompt, fenced: encodeReviewPrompt(record.prompt),
+          unicode, 'unicode-fenced': encodeReviewPrompt(unicode) };
+        const resumed = state !== 'prepared';
+        text = resumed ? variants[kind] : variants['unicode-fenced'];
+        replacement = text === variants.plain ? variants['unicode-fenced'] : variants.plain;
+        reviews.save(record, { state, project: { id: projectId, origin: 'https://example.com' }, startURL: homeURL,
+          origin: 'https://example.com', baselineIds: [], baselineHistory: [],
+          ...(state === 'uncertain' ? { error: { code: 'target_obscured' } } : {}) });
+        if (resumed) view.draft = text;
+        reads = 0;
+        if (swap) {
+          await assert.rejects(reviews.submit(record.id, documentId, undefined, Date.now() + 30000), { code: 'draft_conflict' });
+          assert.equal(clicks, 0);
+          assert.equal(reviews.get(record.id).sendAttemptedAt, undefined);
+          assert.equal(view.draft, replacement);
+        } else {
+          const submitted = await reviews.submit(record.id, documentId, undefined, Date.now() + 30000);
+          assert.equal(submitted.state, 'submitted');
+          assert.equal(submitted.prompt, record.prompt);
+          assert.equal(submitted.promptHash, record.promptHash);
+          assert.deepEqual(submitted.sources, record.sources);
+          assert.equal(view.messages[0].text, text);
+          const parsed = JSON.parse(text.split('\n').find(line => line.startsWith('{"id":')));
+          assert.equal(parsed.files[0].content, source);
+          assert.equal(hash(parsed.files[0].content), record.sources[0].sha256);
+          assert.equal(Buffer.byteLength(parsed.files[0].content), record.sources[0].bytes);
+          assert.equal(clicks, 1);
+        }
+        assert.equal(fills, resumed ? 0 : swap ? 0 : 1);
+      }
     }
   }
 });

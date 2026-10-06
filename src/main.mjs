@@ -7,15 +7,25 @@ import { Browser } from './browser.mjs';
 import { startServer } from './server.mjs';
 import { defaultProfile, prepareProfile, writePrivateJSON } from './profile.mjs';
 import { readProject } from './project.mjs';
-import { permissionPolicy } from './permissions.mjs';
+import { permissionDetails, permissionPolicy } from './permissions.mjs';
 import { isWebURL } from './protocol.mjs';
+import { redactNavigationWarning } from './warnings.mjs';
+
+process.prependListener('warning', redactNavigationWarning);
+
+function reportError(event, message, error) {
+  const record = { event, message };
+  if (typeof error?.code === 'string' && /^(ERR_[A-Z0-9_]{1,64}|E[A-Z0-9]{1,31})$/.test(error.code)) record.code = error.code;
+  if (Number.isInteger(error?.errno) && error.errno < 0 && error.errno >= -2147483648) record.errno = error.errno;
+  console.error(JSON.stringify(record));
+}
 
 process.on('uncaughtException', (error) => {
-  console.error(error);
+  reportError('uncaught_exception', 'Unexpected application exception.', error);
   app.exit(1);
 });
 process.on('unhandledRejection', (error) => {
-  console.error(error);
+  reportError('unhandled_rejection', 'Unexpected application rejection.', error);
   app.exit(1);
 });
 
@@ -59,18 +69,22 @@ if (values.help) {
     };
     protect(window.webContents);
     const permissions = permissionPolicy();
-    window.webContents.session.setPermissionCheckHandler((_contents, permission, origin) => permissions.get(permission, origin) === true);
+    window.webContents.session.setPermissionCheckHandler((_contents, permission, origin, details) => {
+      const scope = permission === 'media' ? { mediaTypes: [details?.mediaType] } : details;
+      return permissions.get(permission, origin, scope) === true;
+    });
     window.webContents.session.setPermissionRequestHandler(async (contents, permission, callback, details) => {
-      if (!isWebURL(details.requestingUrl) || !contents || contents.isDestroyed()) return callback(false);
-      const decision = permissions.get(permission, details.requestingUrl);
+      if (!isWebURL(details?.requestingUrl) || !contents || contents.isDestroyed()) return callback(false);
+      const decision = permissions.get(permission, details.requestingUrl, details);
       if (decision !== undefined) return callback(decision);
       const owner = BrowserWindow.fromWebContents(contents);
       if (!owner || owner.isDestroyed()) return callback(false);
       console.error(JSON.stringify({ event: 'permission_request', permission, origin: new URL(details.requestingUrl).origin }));
       const result = await dialog.showMessageBox(owner, { type: 'question', title: 'Naru',
-        message: `${new URL(details.requestingUrl).origin} 요청: ${permission}`, buttons: ['거부', '이번 실행 동안 허용'], defaultId: 0, cancelId: 0 });
+        message: `${new URL(details.requestingUrl).origin} 요청: ${permission}`, detail: permissionDetails(permission, details).description,
+        buttons: ['거부', '이번 실행 동안 허용'], defaultId: 0, cancelId: 0 });
       const allowed = result.response === 1 && !contents.isDestroyed();
-      permissions.set(permission, details.requestingUrl, allowed);
+      permissions.set(permission, details.requestingUrl, allowed, details);
       callback(allowed);
     });
     Menu.setApplicationMenu(Menu.buildFromTemplate([
@@ -90,13 +104,13 @@ if (values.help) {
     writePrivateJSON(descriptorPath, descriptor);
     app.on('will-quit', () => {
       server.close();
-      try { unlinkSync(descriptorPath); } catch (error) { if (error.code !== 'ENOENT') console.error(error); }
+      try { unlinkSync(descriptorPath); } catch (error) { if (error.code !== 'ENOENT') reportError('connection_cleanup_failed', 'Connection cleanup failed.', error); }
     });
     try { await window.loadURL(initialURL); }
-    catch (error) { console.error(JSON.stringify({ event: 'initial_navigation_failed', message: error.message })); }
+    catch (error) { reportError('initial_navigation_failed', 'Initial navigation failed.', error); }
     console.log(JSON.stringify({ event: 'ready', origin: descriptor.origin, profile }));
     }).catch((error) => {
-      console.error(error);
+      reportError('initialization_failed', 'Application initialization failed.', error);
       app.exit(1);
     });
   }

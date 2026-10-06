@@ -11,7 +11,7 @@ npm ci
 npm start
 ```
 
-프로젝트를 고정하면 해당 프로젝트에서 시작하며, 최초 시작 페이지는 `https://chatgpt.com/`다. 프로필은 `$HOME/.chatgpt-relay`다. 서비스 계정에 처음 로그인하는 절차는 열린 창에서 직접 진행한다. 앱을 종료해도 프로필·요청 기록은 유지한다. `https://chatgpt.com`의 `persistent-storage` 권한은 전용 프로필 저장 용도로 허용하며 재시작마다 묻지 않는다. 나머지 권한의 허용·거부는 해당 실행 동안만 유지한다.
+프로젝트를 고정하면 해당 프로젝트에서 시작하며, 최초 시작 페이지는 `https://chatgpt.com/`다. 프로필은 `$HOME/.chatgpt-relay`다. 서비스 계정에 처음 로그인하는 절차는 열린 창에서 직접 진행한다. 앱을 종료해도 프로필·요청 기록은 유지한다. `https://chatgpt.com`의 `persistent-storage` 권한은 전용 프로필 저장 용도로 허용하며 재시작마다 묻지 않는다. 나머지 권한의 허용·거부는 해당 실행 동안만 유지한다. 마이크·카메라와 파일 대상·읽기·쓰기는 각각 구분해 승인한다.
 
 ```sh
 npm start -- --profile ./artifacts/dev-profile --url https://example.com/
@@ -84,14 +84,15 @@ npm run naru -- ask --continue-from review.txt --effort high --question '첫 번
 
 `review-status <UUID>`의 `phase`와 `lastFailure`로 페이지 확인·열기, effort 선택·입력·전송 중 멈춘 단계와 오류를 확인한다. 실행 기한이 지나면 전송 시도 전에는 `failed`, 이후에는 `uncertain`을 기록한다. 이전 브라우저 작업이 아직 종료되지 않았으면 새 명령은 계속 차단되며, `status.execution`이 비어 있을 때 재개할 수 있다. 앱을 종료했다가 다시 열어도 같은 프로필과 체크포인트를 사용하며, 기록된 프로젝트 바인딩이 바뀌었으면 재개하지 않는다. `--deadline`은 준비·전송·각 회수 명령의 실행 기한이며, 오류 원인 확인 없이 기한만 늘려 새 요청을 만들지 않는다.
 
-리뷰 본문·상태·결과는 전용 프로필에 보존한다. 요청 UUID와 메시지 ID로 전송한 메시지를 식별하고 원문 검증은 별도로 수행한다. 링크 위젯의 복사 제외 장식을 제거하고 실제 inline code 범위를 원문의 전체 백틱 구분자·내용과 대조한다. 화면 표기에서 추가된 [CommonMark ASCII 구두점 escape](https://spec.commonmark.org/0.31.2/#backslash-escapes)와 원문 URL을 동일한 label·destination으로 감싼 자동 링크만 허용하며, 원문 문자 삭제·치환이나 링크 대상 변경은 `review_content_mismatch`로 중단한다. 답변은 해당 요청의 메시지 식별자, 응답 완료 버튼 또는 해당 응답의 작업 영역, 생성 중 표시 해제, 요청별 끝 표식과 안정된 본문을 함께 확인한 뒤 신규 파일로 원자적으로 저장한다. 부분 응답·다른 요청의 답변·중복 응답은 완료 결과로 저장하지 않는다. 긴 대화에서 화면 밖으로 빠진 이전 메시지는 대화 이력을 스크롤해 다시 읽고, 메시지 ID·순서·본문을 저장 기록과 대조한다. 이전 원문을 다시 보내지 않는다. 입력·답변·체크포인트에는 비공개 자료가 포함될 수 있으므로 공개 저장소 밖에 둔다.
+리뷰 본문·상태·결과는 전용 프로필에 보존한다. 요청 UUID와 메시지 ID로 전송한 메시지를 식별하고 원문 검증은 별도로 수행한다. 링크 위젯의 복사 제외 장식을 제거하고 실제 inline code 범위를 원문의 전체 백틱 구분자·내용과 대조한다. 화면 표기에서 추가된 [CommonMark ASCII 구두점 escape](https://spec.commonmark.org/0.31.2/#backslash-escapes)와 원문에 있는 문자열의 자동 링크 표시만 허용한다. 원문 문자 삭제·치환이나 표시 문자열과 목적지가 다른 링크는 `review_content_mismatch`로 중단한다. 답변은 해당 요청의 메시지 식별자, 응답 완료 버튼 또는 해당 응답의 작업 영역, 생성 중 표시 해제, 요청별 끝 표식과 안정된 본문을 함께 확인한 뒤 신규 파일로 원자적으로 저장한다. 부분 응답·다른 요청의 답변·중복 응답은 완료 결과로 저장하지 않는다. 긴 대화에서 화면 밖으로 빠진 이전 메시지는 대화 이력을 스크롤해 다시 읽고, 메시지 ID·순서·본문을 저장 기록과 대조한다. 이전 원문을 다시 보내지 않는다. 입력·답변·체크포인트에는 비공개 자료가 포함될 수 있으므로 공개 저장소 밖에 둔다.
 
 ## API
 
-실행 중 `<profile>/connection.json`에 임의 loopback 포트와 실행별 토큰을 저장한다. 파일은 소유자만 읽도록 생성한다. 모든 요청에 `Authorization: Bearer <token>`이 필요하며, 브라우저 Origin 요청은 거절한다.
+실행 중 `<profile>/connection.json`에 임의 loopback 포트와 실행별 토큰을 저장한다. 파일은 소유자만 읽도록 생성한다. CLI는 토큰과 본문을 보내기 전에 nonce/HMAC으로 서버를 인증하고, 인증한 TCP 연결에서만 요청한다. 연결을 잃으면 재전송하지 않는다. 서버 신원 확인을 제외한 모든 요청에 `Authorization: Bearer <token>`이 필요하며, 브라우저 Origin 요청은 거절한다.
 
 | 요청 | 동작 |
 |---|---|
+| `GET /v1/identity` | `X-Naru-Nonce`의 64자리 소문자 hex nonce와 연결 포트에 대한 서버 신원 증명 |
 | `GET /v1/status` | URL·문서 ID·로딩·renderer 상태 |
 | `GET /v1/snapshot` | 문서 ID와 DOM의 대상 속성 목록 |
 | `GET /v1/diagnostics` | 네트워크 실패 총수·최근 100건, 마지막 입력의 처리 단계·브라우저 수신 확인·이벤트 종류(본문·인증값 제외) |
@@ -102,6 +103,8 @@ npm run naru -- ask --continue-from review.txt --effort high --question '첫 번
 | `GET /v1/requests/<UUID>` | 원래 요청의 결과 조회 |
 
 POST는 `Content-Type: application/json`, 본문 최대 8 MiB다. 초과하면 실행하지 않고 오류를 반환한다. 요청 스키마는 `src/protocol.mjs`에서 엄격히 검증한다.
+
+회수 요청 저널에는 원문 사본 대신 리뷰 ID·원문 해시와 해당 시점의 결과를 저장한다. 요청 재조회 시 검증한 정본 원문을 함께 반환하며, 기존 저널 형식도 읽을 수 있다.
 
 `deadlineMs`는 main 프로세스의 실행 기한이다. `review.*` API와 CLI의 `ask`·`submit`·`collect`는 기본 120,000ms, 일반 명령은 기본 30,000ms이며 최대값은 120,000ms다. CLI에서는 `--deadline`으로 명시한 값을 그대로 적용한다. `wait`의 조건 대기 시간을 늘릴 때는 실행 기한도 명시한다.
 

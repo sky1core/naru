@@ -164,6 +164,7 @@ export class Browser {
   }
 
   async reviewView(signal, requiredIds = null, deadlineAt = Date.now() + 30000) {
+    const observedDocumentId = this.documentId;
     let view = await this.reviewSnapshot(signal);
     let messages = view.messages;
     const missing = () => requiredIds !== null && requiredIds.some(id => !messages.some(message => message.id === id));
@@ -234,6 +235,8 @@ export class Browser {
       merge(view.messages);
     }
     const result = { ...view, messages };
+    this.assertDocument(observedDocumentId);
+    Object.defineProperty(result, 'documentId', { value: observedDocumentId });
     Object.defineProperty(result, 'inputHistory', { value: JSON.stringify(view.messages) });
     this.reviewSnapshots.set(result, view);
     return result;
@@ -266,11 +269,52 @@ export class Browser {
     this.assertActive(signal);
   }
 
+  async navigateReview(url, view, signal, deadlineAt) {
+    this.assertActive(signal);
+    this.assertDocument(view.documentId);
+    let settle;
+    let documentStarted = false;
+    const completion = new Promise(resolve => { settle = resolve; });
+    const failed = () => settle(new RelayError('navigation_failed', 'The requested page could not be loaded.'));
+    const started = (_event, _url, inPlace, mainFrame) => { if (mainFrame && !inPlace) documentStarted = true; };
+    const finished = () => { if (documentStarted) settle(null); };
+    const prevented = () => settle(new RelayError('draft_conflict', 'The page prevented navigation to preserve user work.'));
+    const aborted = () => settle(new RelayError('command_timeout', 'Navigation deadline expired.', 504));
+    const loadFailed = (_event, _code, _description, _url, mainFrame) => { if (mainFrame) failed(); };
+    this.contents.on('did-start-navigation', started);
+    this.contents.on('did-finish-load', finished);
+    this.contents.on('did-fail-load', loadFailed);
+    this.contents.on('will-prevent-unload', prevented);
+    signal?.addEventListener('abort', aborted, { once: true });
+    const timer = setTimeout(aborted, Math.max(0, deadlineAt - Date.now()));
+    try {
+      const input = { action: 'navigate', url, expectedURL: view.url, expectedHistory: view.inputHistory, deadlineAt };
+      let result;
+      try {
+        result = await this.contents.executeJavaScriptInIsolatedWorld(999, [
+          { code: `(${inspectChatGPT.toString()})(${JSON.stringify(input)}, (${inspectDOM.toString()}))` },
+        ]);
+      } catch { throw new RelayError('navigation_failed', 'The navigation result could not be confirmed.'); }
+      if (result.problem) throw new RelayError(result.problem.code, result.problem.message);
+      const failure = await completion;
+      if (failure) throw failure;
+      this.assertActive(signal);
+      return this.status();
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', aborted);
+      this.contents.removeListener('did-start-navigation', started);
+      this.contents.removeListener('did-finish-load', finished);
+      this.contents.removeListener('did-fail-load', loadFailed);
+      this.contents.removeListener('will-prevent-unload', prevented);
+    }
+  }
+
   async execute(command, signal, deadlineAt, beforeDispatch) {
     this.assertActive(signal);
     if (command.action === 'navigate') {
       try { await this.contents.loadURL(command.url); }
-      catch (error) { throw new RelayError('navigation_failed', error.message); }
+      catch { throw new RelayError('navigation_failed', 'The requested page could not be loaded.'); }
       if (this.contents.isLoadingMainFrame()) await once(this.contents, 'did-stop-loading', { signal });
       this.assertActive(signal);
       return this.status();

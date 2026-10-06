@@ -233,17 +233,17 @@ test('the CLI total collection timeout bounds slow review reads without publishi
     const { server, descriptor } = await startServer({ profile, browser: {}, quit() {} });
     writePrivateJSON(join(profile, 'connection.json'), descriptor);
     t.after(async () => { await new Promise(resolveClose => server.close(resolveClose)); });
-    const original = fs.readFileSync;
     let reads = 0;
-    t.mock.method(fs, 'readFileSync', (path, ...args) => {
-      if (path === join(profile, 'reviews', `${prepared.id}.json`) && ++reads === delayedRead) {
-        const until = performance.now() + 1500;
-        while (performance.now() < until) {}
-      }
-      return original(path, ...args);
+    let delaying = true;
+    server.prependListener('request', (request, response) => {
+      if (!delaying || ![ `/v1/reviews/${prepared.id}`, '/v1/commands' ].includes(request.url) || ++reads !== delayedRead) return;
+      const end = response.end.bind(response);
+      response.end = (...args) => {
+        const timer = setTimeout(() => { if (!response.destroyed) end(...args); }, 1500);
+        response.once('close', () => clearTimeout(timer));
+        return response;
+      };
     });
-    syncBuiltinESMExports();
-    t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
     const exec = promisify(execFile);
     await assert.rejects(exec(process.execPath, [wrapper, '--profile', profile, 'collect', '--out', out, '--timeout', String(delayedRead === 1 ? 50 : 200), '--deadline', '120000']), error => {
       assert.match(error.stderr, /review_pending/);
@@ -260,7 +260,7 @@ test('the CLI total collection timeout bounds slow review reads without publishi
     }
     assert.equal(fs.readFileSync(out + '.request.json', 'utf8'), checkpoint);
     assert.equal(fs.existsSync(out), false);
-    t.mock.restoreAll(); syncBuiltinESMExports();
+    delaying = false;
     await exec(process.execPath, ['src/cli.mjs', '--profile', profile, 'collect', '--out', out, '--timeout', '3000']);
     assert.equal(fs.readFileSync(out, 'utf8'), answer);
     assert.equal(reviews.get(prepared.id).state, 'completed');

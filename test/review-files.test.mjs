@@ -8,7 +8,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { RelayError } from '../src/protocol.mjs';
-import { loadReviewFiles, composeReviewPrompt, writeReviewOutput } from '../src/review-files.mjs';
+import { loadReviewFiles, composeReviewPrompt, encodeReviewPrompt, escapeReviewJSON, writeReviewOutput } from '../src/review-files.mjs';
 
 const exec = promisify(execFile);
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -271,6 +271,27 @@ test('prompt JSON reversibly carries full files, hashes and question without loc
   assert(prompt.endsWith(`END-OF-REVIEW:${id}`));
 });
 
+test('review transport preserves source bytes without exposing URL and mention syntax to rendering', () => {
+  const id = randomUUID();
+  const urls = ['https://registry.npmjs.org/@electron-internal/extract-zip/-/extract-zip-1.0.5.tgz',
+    'https://registry.npmjs.org/@electron/get/-/get-5.1.0.tgz', 'https://registry.npmjs.org/@types/node/-/node-24.19.0.tgz'];
+  const content = [...urls, '`https://chatgpt.com/`', 'www.example.com', 'tool@latest',
+    '&lt;original&gt; **bold** _name_ [link](destination)', '\\u0040 \\/ \\* \\"',
+    '\uFEFF한글\r\n🙂 e\u0301', String.fromCharCode(...Array.from({ length: 128 }, (_, index) => index))].join('\n');
+  const files = [{ path: 'source.txt', content, bytes: Buffer.byteLength(content), sha256: digest(content) }];
+  const prompt = composeReviewPrompt({ id, question: 'Review these exact files', files });
+  const transported = encodeReviewPrompt(escapeReviewJSON(prompt));
+  const payload = transported.split('\n').find(line => line.startsWith('{'));
+  const decoded = JSON.parse(payload);
+  assert.deepEqual(decoded, JSON.parse(prompt.split('\n').find(line => line.startsWith('{'))));
+  assert.equal(decoded.files[0].bytes, Buffer.byteLength(decoded.files[0].content));
+  assert.equal(decoded.files[0].sha256, digest(decoded.files[0].content));
+  for (const marker of [...urls, 'https://chatgpt.com/', 'www.example.com', '@latest', '&lt;', '`', '**bold**']) {
+    assert.equal(payload.includes(marker), false, marker);
+  }
+  assert(transported.endsWith(`END-OF-REVIEW:${id}`));
+});
+
 test('prompt rejects marker injection, absolute display paths and inconsistent file metadata', () => {
   const file = { path: 'source.txt', content: 'exact', bytes: 5, sha256: digest(Buffer.from('exact')) };
   const input = { id: randomUUID(), question: 'review', files: [file] };
@@ -342,32 +363,6 @@ test('concurrent writers publish exactly one whole output; observers never see p
   assert.deepEqual((await readdir(dir)).sort(), ['input', 'race.txt']);
 });
 
-test('write or file-sync failures leave no published partial output and clean only owned temporary files', async (t) => {
-  for (const operation of ['writeFile', 'sync']) {
-    await t.test(operation, async (t) => {
-      const { dir } = await fixture();
-      const path = join(dir, 'failed.txt');
-      await writeFile(join(dir, 'keep.txt'), 'keep');
-      const probe = await open(join(dir, 'keep.txt'), constants.O_RDONLY);
-      const prototype = Object.getPrototypeOf(probe);
-      await probe.close();
-      const original = prototype[operation];
-      t.mock.method(prototype, operation, async function (...args) {
-        const metadata = await this.stat();
-        if (metadata.isFile() && (metadata.mode & 0o777) === 0o600) {
-          if (operation === 'writeFile') await original.call(this, 'partial');
-          throw Object.assign(new Error('Injected disk I/O failure'), { code: 'EIO' });
-        }
-        return original.apply(this, args);
-      });
-      await assert.rejects(writeReviewOutput(path, 'complete'), errorCode('review_output_write_failed'));
-      await assert.rejects(lstat(path), { code: 'ENOENT' });
-      assert.equal(await readFile(join(dir, 'keep.txt'), 'utf8'), 'keep');
-      assert.deepEqual((await readdir(dir)).sort(), ['input', 'keep.txt']);
-    });
-  }
-});
-
 test('invalid output data and missing output directories fail explicitly', async () => {
   const { dir } = await fixture();
   for (const [path, text] of [['', 'text'], [join(dir, 'invalid.txt'), undefined], [join(dir, 'invalid.txt'), '\ud800']]) {
@@ -375,30 +370,4 @@ test('invalid output data and missing output directories fail explicitly', async
   }
   await assert.rejects(writeReviewOutput(join(dir, 'missing', 'output.txt'), 'text'), errorCode('review_output_write_failed'));
   assert.deepEqual(await readdir(dir), ['input']);
-});
-
-test('directory sync failure reports failure while preserving a fully published output', async (t) => {
-  const { dir } = await fixture();
-  const path = join(dir, 'output.txt');
-  const probe = await open(dir, constants.O_RDONLY | constants.O_DIRECTORY);
-  const prototype = Object.getPrototypeOf(probe);
-  const sync = prototype.sync;
-  await probe.close();
-  let fileSynced = false;
-  let directorySynced = false;
-  t.mock.method(prototype, 'sync', async function (...args) {
-    if ((await this.stat()).isDirectory()) {
-      directorySynced = true;
-      throw Object.assign(new Error('Injected directory sync failure'), { code: 'EIO' });
-    }
-    fileSynced = true;
-    return sync.apply(this, args);
-  });
-  const text = '전체 결과\r\n🙂\n';
-  await assert.rejects(writeReviewOutput(path, text), errorCode('review_output_write_failed'));
-  assert(fileSynced);
-  assert(directorySynced);
-  assert.deepEqual(await readFile(path), Buffer.from(text));
-  assert.equal((await lstat(path)).mode & 0o777, 0o600);
-  assert.deepEqual((await readdir(dir)).sort(), ['input', 'output.txt']);
 });

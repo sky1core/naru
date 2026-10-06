@@ -20,6 +20,8 @@ const fixture = (mode) => `<!doctype html><meta charset="utf-8"><style>button,te
 <form data-chatgpt-composer data-composer-placement="home"><textarea id="prompt-textarea"></textarea><button type="button" data-codex-intelligence-trigger="true" data-selected-reasoning-effort="medium" aria-expanded="false">任意文字</button><button type="submit" data-testid="send-button">번역</button></form><pre id="sent">${''}</pre><div id="messages"></div>
 <script>
 const mode=${JSON.stringify(mode)};
+const threadMode=mode==='thread'||mode.startsWith('retained-');let activePage,inactivePage;
+function retainPage(){inactivePage?.remove();inactivePage=activePage.cloneNode(true);inactivePage.dataset.appShellActivePage='false';inactivePage.hidden=true;inactivePage.querySelector('#prompt-textarea').value='Preserved inactive draft';activePage.after(inactivePage)}
 const states=mode==='reordered'?['pro','high','none','max','medium']:['none','medium','high','max','pro'];
 let index=states.indexOf(mode==='initial-pro'?'pro':'medium');let menu;const trigger=document.querySelector('[data-codex-intelligence-trigger]');
 function raw(){return states[index]==='pro'?'medium':states[index]}
@@ -31,7 +33,8 @@ const editor=document.getElementById('prompt-textarea');const send=document.quer
 if(mode==='effort-race')send.onpointerdown=()=>{index=states.indexOf('high');update()};
 if(mode==='pro-race')send.onpointerdown=()=>{open();index=states.indexOf('medium');update();close()};
 if(mode==='draft-race')trigger.onpointerdown=()=>editor.value='user draft';
-document.querySelector('form').onsubmit=e=>{e.preventDefault();localStorage.setItem('sent',states[index]);document.getElementById('sent').textContent=states[index];const prompt=editor.value;editor.value='';if(mode==='thread'){const form=editor.closest('form');let owner=form.closest('[data-map-composer-conversation]');if(!owner){owner=document.createElement('div');owner.dataset.mapComposerConversation='local-scope';owner.style.display='contents';form.before(owner);owner.append(form);form.dataset.composerPlacement='thread';history.replaceState(null,'','/g/${projectId}/c/01234567-89ab-4cde-8123-0123456789ab')}}const id=prompt.match(/Review request UUID: ([a-f0-9-]+)/)[1];if(mode!=='thread')history.replaceState(null,'','/g/${projectId}/c/'+id);for(const [role,text]of [['user',prompt],['assistant','answer\\nEND-OF-REVIEW:'+id]]){const turn=document.createElement('section');turn.dataset.testid='conversation-turn-'+role;const body=document.createElement('div');body.dataset.messageAuthorRole=role;body.dataset.messageId=role+'-'+id;body.textContent=text;turn.append(body);if(role==='assistant'){const copy=document.createElement('button');copy.dataset.testid='copy-turn-action-button';copy.textContent='Copy';turn.append(copy)}document.getElementById('messages').append(turn)}};
+document.querySelector('form').onsubmit=e=>{e.preventDefault();localStorage.setItem('sent',states[index]);document.getElementById('sent').textContent=states[index];const prompt=editor.value;editor.value='';if(threadMode){const form=editor.closest('form');let owner=form.closest('[data-map-composer-conversation]');if(!owner){owner=document.createElement('div');owner.dataset.mapComposerConversation='local-scope';owner.style.display='contents';form.before(owner);owner.append(form);form.dataset.composerPlacement='thread';history.replaceState(null,'','/g/${projectId}/c/01234567-89ab-4cde-8123-0123456789ab')}}const id=prompt.match(/Review request UUID: ([a-f0-9-]+)/)[1];if(!threadMode)history.replaceState(null,'','/g/${projectId}/c/'+id);for(const [role,text]of [['user',prompt],['assistant','answer\\nEND-OF-REVIEW:'+id]]){const turn=document.createElement('section');turn.dataset.testid='conversation-turn-'+role;const body=document.createElement('div');body.dataset.messageAuthorRole=role;body.dataset.messageId=role+'-'+id;body.textContent=text;turn.append(body);if(role==='assistant'){const copy=document.createElement('button');copy.dataset.testid='copy-turn-action-button';copy.textContent='Copy';turn.append(copy)}document.getElementById('messages').append(turn)}if(activePage)retainPage()};
+if(mode.startsWith('retained-')){activePage=document.createElement('div');activePage.dataset.appShellActivePage='true';const form=editor.closest('form');form.before(activePage);activePage.append(form,document.getElementById('sent'),document.getElementById('messages'));retainPage();if(mode==='retained-ambiguous'){inactivePage.dataset.appShellActivePage='true';inactivePage.hidden=false}if(mode==='retained-race')send.onpointerdown=()=>{activePage.dataset.appShellActivePage='false';activePage.hidden=true;inactivePage.dataset.appShellActivePage='true';inactivePage.hidden=false}};
 </script>`;
 
 async function launch(profile, url, evidence) {
@@ -170,8 +173,9 @@ test('effort selection through real Electron and CLI', { timeout: 90000 }, async
     assert.equal(await readFile(`${out}.request.json`, 'utf8'), checkpoint);
     const messages = (await call('/v1/review-ui')).messages;
     assert.equal(messages.length, 2);
-    assert.equal(messages[0].text, before.prompt.replace(/^(\{"id":.*\})$/m, '```json\n$1\n```'));
     const transmitted = JSON.parse(messages[0].text.split('\n').find(line => line.startsWith('{')));
+    assert.deepEqual(transmitted, JSON.parse(before.prompt.split('\n').find(line => line.startsWith('{'))));
+    assert.equal(messages[0].text.split('\n').at(-1), before.prompt.split('\n').at(-1));
     for (let index = 0; index < paths.length; index++) {
       const original = await readFile(paths[index], 'utf8');
       assert.equal(transmitted.files[index].content, original);
@@ -205,5 +209,60 @@ test('effort selection through real Electron and CLI', { timeout: 90000 }, async
     for (const args of [['prepare', '--question', 'X', '--effort', 'bogus'], ['ask', '--request', input, '--effort', 'high'], ['collect', '--effort', 'high'], ['status', '--effort', 'high']]) {
       await assert.rejects(exec(process.execPath, ['src/cli.mjs', '--profile', profile, ...args, '--out', join(evidence, randomUUID())]));
     }
+  });
+});
+
+
+test('retained pages preserve active review routing and inactive drafts', { timeout: 45000 }, async t => {
+  await mkdir('artifacts/effort-runs', { recursive: true });
+  const evidence = await mkdtemp(resolve('artifacts/effort-runs/retained-'));
+  const profile = join(evidence, 'profile');
+  let mode = 'normal';
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); response.end(fixture(mode));
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const url = `http://127.0.0.1:${server.address().port}/g/${projectId}/project`;
+  const app = await launch(profile, url, evidence), call = app.call;
+  t.after(async () => { await app.stop(); await new Promise(done => server.close(done)); });
+  const run = async command => (await call('/v1/commands', { id: randomUUID(), command, deadlineMs: 10000 })).result;
+  await run({ action: 'project.bind', documentId: (await call('/v1/status')).documentId });
+  const read = async (id, active) => (await run({ action: 'read', documentId: (await call('/v1/status')).documentId,
+    target: { attribute: 'id', value: id, scope: { attribute: 'data-app-shell-active-page', value: String(active) } } })).text;
+  for (const selected of ['retained-normal', 'retained-ambiguous', 'retained-race']) await t.test(selected, async () => {
+    mode = selected; await run({ action: 'navigate', url });
+    const first = await run({ action: 'review.prepare', reviewId: randomUUID(), question: 'Review', files: [], effort: 'max' });
+    const command = { action: 'review.submit', reviewId: first.id, documentId: (await call('/v1/status')).documentId };
+    if (selected !== 'retained-normal') {
+      await assert.rejects(run(command), { code: selected === 'retained-race' ? 'target_changed' : 'ambiguous_chatgpt_ui' });
+      const record = await call(`/v1/reviews/${first.id}`);
+      assert.equal(record.answer, undefined);
+      if (selected === 'retained-ambiguous') assert.equal(record.sendAttemptedAt, undefined);
+      else {
+        assert.equal(await read('sent', true), ''); assert.equal(await read('sent', false), '');
+        assert.equal(await read('prompt-textarea', true), 'Preserved inactive draft');
+      }
+      return;
+    }
+    await run(command);
+    const previous = await run({ action: 'review.collect', reviewId: first.id, waitMs: 1500 });
+    assert.equal(previous.state, 'completed'); assert.equal(previous.selectedEffort.effort, 'max');
+    assert.equal(await read('prompt-textarea', false), 'Preserved inactive draft');
+    const next = await run({ action: 'review.prepare', reviewId: randomUUID(), question: 'Follow up', files: [], effort: 'pro',
+      continueFrom: { reviewId: previous.id, promptHash: previous.promptHash, answerHash: previous.answerHash, effort: previous.effort } });
+    await run({ action: 'review.submit', reviewId: next.id, documentId: (await call('/v1/status')).documentId });
+    const completed = await run({ action: 'review.collect', reviewId: next.id, waitMs: 1500 });
+    assert.equal(completed.state, 'completed'); assert.equal(completed.selectedEffort.effort, 'pro');
+    assert.equal(await read('sent', true), 'pro'); assert.equal(await read('prompt-textarea', false), 'Preserved inactive draft');
+    const view = await call('/v1/review-ui');
+    assert.equal(view.messages.length, 4);
+    assert.equal((await run({ action: 'read', documentId: (await call('/v1/status')).documentId, target: view.composer })).text, '');
+    const requestPath = join(evidence, 'read-active-composer.json');
+    await writeFile(requestPath, JSON.stringify({ id: randomUUID(), command: { action: 'read',
+      documentId: (await call('/v1/status')).documentId, target: view.composer } }));
+    const result = await exec(process.execPath, ['src/cli.mjs', 'run', '--profile', profile, '--file', requestPath]);
+    assert.equal(JSON.parse(result.stdout).result.text, '');
+    assert.equal((await run({ action: 'review.collect', reviewId: next.id, waitMs: 0 })).state, 'completed');
+    assert.equal((await call('/v1/review-ui')).messages.length, 4);
   });
 });

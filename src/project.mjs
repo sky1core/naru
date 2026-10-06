@@ -59,7 +59,7 @@ export class Project {
     if (current.draft || current.busy || current.attachments) {
       throw new RelayError('draft_conflict', 'The current draft or generation must remain untouched.');
     }
-    await this.browser.execute({ action: 'navigate', url: binding.url }, signal, deadlineAt);
+    await this.browser.navigateReview(binding.url, current, signal, deadlineAt);
     while (true) {
       this.browser.assertActive(signal);
       const view = await this.browser.reviewView(signal);

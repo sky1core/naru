@@ -1,9 +1,9 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { resolve, relative, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { connect } from './client.mjs';
-import { readUTF8File } from './cli-files.mjs';
+import { readJSONFile, assertAPIRequestSize, assertJSONInputSize } from './cli-files.mjs';
 import { loadReviewFiles, composeReviewPrompt, writeReviewOutput } from './review-files.mjs';
 import { commandSchema, requestSchema, requestIdSchema, deadlineMsSchema, defaultReviewDeadlineMs, RelayError, maxRequestBytes } from './protocol.mjs';
 
@@ -26,11 +26,18 @@ async function post(call, command, deadlineMs, id = randomUUID()) {
 }
 
 async function loadCheckpoint(path, profile) {
-  const checkpoint = JSON.parse(await readUTF8File(path));
-  const parsed = commandSchema.safeParse(checkpoint.command);
-  if (checkpoint.version !== 2 || checkpoint.profile !== profile || !requestIdSchema.safeParse(checkpoint.prepareRequestId).success ||
-      !parsed.success || parsed.data.action !== 'review.prepare' || checkpoint.reviewId !== parsed.data.reviewId ||
-      checkpoint.promptHash !== inputHash(parsed.data)) {
+  const checkpoint = await readJSONFile(path, { kind: 'checkpoint', profile });
+  const parsed = commandSchema.safeParse(checkpoint?.command);
+  if (checkpoint?.version !== 2 || checkpoint.profile !== profile || !requestIdSchema.safeParse(checkpoint.prepareRequestId).success ||
+      checkpoint.reviewId !== checkpoint.command?.reviewId) {
+    throw new RelayError('checkpoint_mismatch', 'Checkpoint must contain the original input, its hash, and this profile.');
+  }
+  assertJSONInputSize(checkpoint.command, parsed);
+  if (!parsed.success || parsed.data.action !== 'review.prepare') {
+    throw new RelayError('checkpoint_mismatch', 'Checkpoint must contain the original input, its hash, and this profile.');
+  }
+  assertRequestSize(parsed.data, 1);
+  if (checkpoint.promptHash !== inputHash(parsed.data)) {
     throw new RelayError('checkpoint_mismatch', 'Checkpoint must contain the original input, its hash, and this profile.');
   }
   return checkpoint;
@@ -42,17 +49,29 @@ async function requireNewOutput(path) {
   throw new RelayError('output_exists', 'Output already exists; no request was submitted.');
 }
 
-async function inputCommand(values) {
-  if (values.request) {
+export function validateReviewInputOptions(values) {
+  if (values.request !== undefined) {
     if (values.question !== undefined || values.file?.length || values.id !== undefined || values['base-dir'] !== undefined || values.effort !== undefined || values.part !== undefined || values['continue-from'] !== undefined) {
       throw invalid('--request cannot be combined with source input options.');
     }
-    const command = commandSchema.parse(JSON.parse(await readUTF8File(values.request)));
-    if (command.action !== 'review.prepare') throw invalid('--request requires a prepared review input file.');
+  }
+}
+
+function parseInputCommand(input) {
+  const parsed = commandSchema.safeParse(input);
+  assertJSONInputSize(input, parsed);
+  if (!parsed.success || parsed.data.action !== 'review.prepare') throw invalid('Input must contain a valid prepared review command.');
+  return parsed.data;
+}
+
+async function inputCommand(values, deadlineMs = defaultReviewDeadlineMs) {
+  if (values.request !== undefined) {
+    const command = parseInputCommand(await readJSONFile(values.request, { kind: 'command' }));
+    assertRequestSize(command, deadlineMs);
     return command;
   }
   if (!values.question?.trim()) throw invalid('--question is required.');
-  const files = await loadReviewFiles(values.file || [], { baseDir: values['base-dir'] === undefined ? process.cwd() : resolve(values['base-dir']) });
+  if (Buffer.byteLength(values.question) > maxRequestBytes) throw inputTooLarge();
   let part;
   if (values.part !== undefined) {
     const match = values.part.match(/^([1-9][0-9]*)\/([1-9][0-9]*)$/);
@@ -70,13 +89,26 @@ async function inputCommand(values) {
     continueFrom = { reviewId: previous.reviewId, promptHash: previous.promptHash, effort: previous.command.effort,
       ...(answer === undefined ? {} : { answerHash: createHash('sha256').update(answer).digest('hex') }) };
   }
-  const command = commandSchema.parse({ action: 'review.prepare', part, continueFrom, reviewId: values.id === undefined ? randomUUID() : values.id, question: values.question, files, effort: values.effort });
+  const command = parseInputCommand({ action: 'review.prepare', part, continueFrom, reviewId: values.id === undefined ? randomUUID() : values.id, question: values.question, files: [], effort: values.effort });
+  let metadataBytes = assertRequestSize(command, deadlineMs);
+  const baseDir = values['base-dir'] === undefined ? process.cwd() : resolve(values['base-dir']);
+  const paths = values.file || [];
+  for (const [index, path] of paths.entries()) {
+    const display = relative(baseDir, resolve(baseDir, path)).split(sep).join('/');
+    if (Buffer.byteLength(display) > maxRequestBytes) throw inputTooLarge();
+    metadataBytes += Buffer.byteLength(JSON.stringify({ path: display, content: '', sha256: '0'.repeat(64), bytes: 0 })) + (index > 0 ? 1 : 0);
+    if (metadataBytes > maxRequestBytes) throw inputTooLarge();
+  }
+  command.files = await loadReviewFiles(values.file || [], {
+    baseDir, maxBytes: maxRequestBytes - metadataBytes,
+  });
   return command;
 }
 
+const inputTooLarge = () => new RelayError('body_too_large', 'Review input exceeds the 8 MiB API request limit. No source was truncated or sent.', 413);
+
 function assertRequestSize(command, deadlineMs = defaultReviewDeadlineMs) {
-  const bytes = Buffer.byteLength(JSON.stringify({ id: randomUUID(), deadlineMs, command }));
-  if (bytes > maxRequestBytes) throw new RelayError('body_too_large', 'Review input exceeds the 8 MiB API request limit. No source was truncated or sent.', 413);
+  return assertAPIRequestSize({ id: randomUUID(), deadlineMs, command });
 }
 
 async function collect(call, checkpoint, out, timeoutMs, deadlineMs) {
@@ -115,6 +147,7 @@ async function collect(call, checkpoint, out, timeoutMs, deadlineMs) {
 }
 
 export async function reviewCLI(action, arg, values) {
+  validateReviewInputOptions(values);
   if (['collect', 'submit', 'doctor', 'review-status'].includes(action) &&
       (values.question !== undefined || values.file?.length || values.request !== undefined || values['base-dir'] !== undefined || values.effort !== undefined || values.part !== undefined || values['continue-from'] !== undefined)) {
     throw invalid(`${action} does not accept new review input.`);
@@ -168,7 +201,7 @@ export async function reviewCLI(action, arg, values) {
     }
     return collect(call, checkpoint, out, timeoutMs, deadlineMs);
   }
-  const command = await inputCommand(values);
+  const command = await inputCommand(values, deadlineMs);
   assertRequestSize(command, deadlineMs);
   const checkpoint = { version: 2, reviewId: command.reviewId, profile, command, promptHash: inputHash(command), prepareRequestId: randomUUID() };
   await writeReviewOutput(checkpointPath, `${JSON.stringify(checkpoint)}\n`);

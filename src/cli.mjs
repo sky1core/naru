@@ -5,12 +5,23 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { connect } from './client.mjs';
 import { defaultProfile } from './profile.mjs';
-import { requestSchema, requestIdSchema, RelayError, publicError } from './protocol.mjs';
-import { reviewCLI } from './review-cli.mjs';
-import { readUTF8File } from './cli-files.mjs';
+import { requestSchema, requestIdSchema, maxRequestBytes, RelayError, publicError } from './protocol.mjs';
+import { reviewCLI, validateReviewInputOptions } from './review-cli.mjs';
+import { readUTF8File, readJSONFile, assertAPIRequestSize, assertJSONInputSize } from './cli-files.mjs';
+
+const targetOptions = ['id', 'deadline', 'document', 'attr', 'value'];
+const reviewInputOptions = ['question', 'file', 'out', 'id', 'base-dir', 'effort', 'part', 'continue-from', 'request'];
+const commandOptions = {
+  status: [], snapshot: [], diagnostics: [], project: [], request: [], doctor: [], 'review-status': [],
+  navigate: ['id', 'deadline'], fill: [...targetOptions, 'file'], click: targetOptions, read: targetOptions, press: targetOptions,
+  wait: [...targetOptions, 'state', 'timeout'], screenshot: ['id', 'deadline', 'out'],
+  quit: ['id', 'deadline'], 'project-bind': ['id', 'deadline'], 'project-open': ['id', 'deadline'], run: ['file'],
+  prepare: reviewInputOptions, ask: [...reviewInputOptions, 'deadline', 'timeout'],
+  collect: ['out', 'id', 'deadline', 'timeout'], submit: ['out', 'id', 'deadline', 'timeout'],
+};
 
 try {
-  const { values, positionals } = parseArgs({ allowPositionals: true, options: {
+  const { values, positionals, tokens } = parseArgs({ allowPositionals: true, tokens: true, options: {
     profile: { type: 'string', default: defaultProfile },
     help: { type: 'boolean', default: false },
     id: { type: 'string' }, document: { type: 'string' },
@@ -47,15 +58,26 @@ Without --continue-from, each new review opens a fresh document at the bound pro
 --continue-from <previous answer file> also sends an ordinary follow-up in the same conversation.
 --effort selects and verifies the requested reasoning effort before sending; omitted effort preserves the current composer selection.
 --base-dir <directory> sets the source path root. --timeout <ms> bounds collection (default 1800000).
-Commands accept --id <UUID>; generated IDs are printed to stderr before dispatch.
---deadline <ms> bounds command execution in the main process (default 120000 for ask/submit/collect, 30000 for other commands; maximum 120000).
-Targets: id, data-testid, name, type, data-message-id, data-message-author-role, data-composer-markdown, data-chatgpt-composer, data-composer-placement, data-app-action-sidebar-project-id, data-codex-intelligence-trigger, data-model-picker-view-toggle, data-map-composer-conversation, data-reasoning-slider, data-model-picker-view, href.
+Commands that create requests accept --id <UUID>; generated IDs are printed to stderr before dispatch. run uses the ID and deadline in its JSON input.
+--deadline <ms> bounds command execution in the main process (default 120000 for ask/submit/collect, 30000 for other dispatched commands; maximum 120000).
+Targets: id, data-testid, name, type, data-message-id, data-message-author-role, data-composer-markdown, data-chatgpt-composer, data-composer-placement, data-app-action-sidebar-project-id, data-codex-intelligence-trigger, data-model-picker-view-toggle, data-map-composer-conversation, data-app-shell-active-page, data-reasoning-slider, data-model-picker-view, href.
 JSON targets accept an explicit scope with one attribute and value; both scope and target must be unique.
 No visible-text selectors, arbitrary scripts, or automatic command retries.`);
   } else {
+    if (!Object.hasOwn(commandOptions, action)) throw new RelayError('invalid_arguments', 'Unknown command.', 400);
+    const allowed = new Set(['profile', 'help', ...commandOptions[action]]);
+    for (const token of tokens) {
+      if (token.kind === 'option' && !allowed.has(token.name)) {
+        throw new RelayError('invalid_arguments', `--${token.name} is not supported by ${action}.`, 400);
+      }
+    }
     if (extra.length) throw new RelayError('invalid_arguments', 'Too many positional arguments.', 400);
+    if (!['navigate', 'press', 'request', 'review-status'].includes(action) && arg !== undefined) {
+      throw new RelayError('invalid_arguments', 'Unexpected positional argument.', 400);
+    }
     let result;
     if (['prepare', 'ask', 'collect', 'submit', 'review-status', 'doctor'].includes(action)) {
+      validateReviewInputOptions(values);
       result = await reviewCLI(action, arg, values);
       if (action === 'doctor' && (result.problem || !result.composer || (result.draftPresent && !result.send))) process.exitCode = 1;
     } else {
@@ -75,7 +97,7 @@ No visible-text selectors, arbitrary scripts, or automatic command retries.`);
       let request;
       if (action === 'run') {
         if (!values.file || arg) throw new RelayError('invalid_arguments', 'run requires --file and no positional argument.', 400);
-        request = JSON.parse(await readUTF8File(oneFile()));
+        request = await readJSONFile(oneFile(), { kind: 'request' });
       } else {
         if (!['navigate', 'press'].includes(action) && arg) throw new RelayError('invalid_arguments', 'Unexpected positional argument.', 400);
         let command = { action };
@@ -87,7 +109,7 @@ No visible-text selectors, arbitrary scripts, or automatic command retries.`);
         }
         if (action === 'fill') {
           if (!values.file) throw new RelayError('invalid_arguments', 'fill requires --file; text is never implicitly read from another source.', 400);
-          command.text = await readUTF8File(oneFile());
+          command.text = await readUTF8File(oneFile(), { maxBytes: maxRequestBytes });
         }
         if (action === 'press') command.key = arg;
         if (action === 'wait') Object.assign(command, { state: values.state, timeoutMs: Number(values.timeout === undefined ? '30000' : values.timeout) });
@@ -95,7 +117,9 @@ No visible-text selectors, arbitrary scripts, or automatic command retries.`);
         request = { id: values.id === undefined ? randomUUID() : values.id, deadlineMs: values.deadline === undefined ? undefined : Number(values.deadline), command };
       }
       const parsed = requestSchema.safeParse(request);
-      if (!parsed.success) throw new RelayError('invalid_command', JSON.stringify(parsed.error.issues), 400);
+      assertJSONInputSize(request, parsed);
+      if (!parsed.success) throw new RelayError('invalid_command', 'Invalid command request.', 400);
+      assertAPIRequestSize(parsed.data);
       console.error(JSON.stringify({ requestId: parsed.data.id }));
       result = await call('/v1/commands', parsed.data);
       if (action === 'screenshot') {
@@ -107,6 +131,6 @@ No visible-text selectors, arbitrary scripts, or automatic command retries.`);
     console.log(JSON.stringify(result, null, 2));
   }
 } catch (error) {
-  console.error(JSON.stringify({ error: error instanceof RelayError ? publicError(error) : { code: 'cli_error', message: error.message } }));
+  console.error(JSON.stringify({ error: error instanceof RelayError ? publicError(error) : { code: 'cli_error', message: 'Unable to complete CLI command.' } }));
   process.exitCode = 1;
 }

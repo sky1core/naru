@@ -2,6 +2,11 @@ export function inspectChatGPT(input, inspectDOM) {
   const visible = (node) => node instanceof HTMLElement && node.getClientRects().length > 0 &&
     getComputedStyle(node).visibility === 'visible' && getComputedStyle(node).display !== 'none';
   const nodes = (selector, parent = document) => Array.from(parent.querySelectorAll(selector));
+  const scopeElements = target => {
+    const roots = target.scope ? scopeElements(target.scope) : [document];
+    return roots.length === 1 ? nodes(`[${target.attribute}]`, roots[0])
+      .filter(node => node.getAttribute(target.attribute) === target.value) : [];
+  };
   const fail = (code, message) => ({ problem: { code, message }, url: location.href, messages: [] });
   const capture = () => {
     if (nodes('#sidebar-login-title').some(visible) || /\/auth\//.test(location.pathname)) {
@@ -14,9 +19,12 @@ export function inspectChatGPT(input, inspectDOM) {
     const modernForm = form?.hasAttribute('data-chatgpt-composer');
     const placement = modernForm ? form.getAttribute('data-composer-placement') : null;
     const thread = placement === 'thread' ? form.closest('[data-map-composer-conversation]') : null;
-    const scope = placement === 'thread'
+    let scope = placement === 'thread'
       ? (thread ? { attribute: 'data-map-composer-conversation', value: thread.getAttribute('data-map-composer-conversation') } : undefined)
       : placement ? { attribute: 'data-composer-placement', value: placement } : undefined;
+    const page = editor?.closest('[data-app-shell-active-page]');
+    if (page && page.getAttribute('data-app-shell-active-page') !== 'true') return fail('ambiguous_chatgpt_ui', 'Composer does not belong to the active page.');
+    if (page && scope) scope = { ...scope, scope: { attribute: 'data-app-shell-active-page', value: 'true' } };
     const sends = modernForm ? nodes('[type="submit"]', form) : nodes('[data-testid="send-button"]');
     const conversationId = location.pathname.match(/\/c\/([^/]+)\/?$/)?.[1];
     const conversationActive = Boolean(conversationId) && nodes('[data-thread-title-trigger] a[href]').some(link => {
@@ -30,7 +38,7 @@ export function inspectChatGPT(input, inspectDOM) {
         node.closest('[data-content-search-turn-key]') === turn &&
         (node.hasAttribute('data-markdown-animated') ||
           !node.closest('[data-chatgpt-search-unit-key], [data-message-id][data-message-author-role]'))));
-    if (sends.length > 1 || (modernForm && (!scope || nodes(`[${scope.attribute}]`).filter(node => node.getAttribute(scope.attribute) === scope.value).length !== 1))) return fail('ambiguous_chatgpt_ui', 'Composer form or send control is not unique.');
+    if (sends.length > 1 || (modernForm && (!scope || scopeElements(scope).length !== 1))) return fail('ambiguous_chatgpt_ui', 'Composer form or send control is not unique.');
     const composer = editor?.id === 'prompt-textarea' ? { attribute: 'id', value: 'prompt-textarea', ...(scope ? { scope } : {}) }
       : editor?.hasAttribute('data-composer-markdown') ? { attribute: 'data-composer-markdown', value: editor.getAttribute('data-composer-markdown'), scope } : null;
     const legacy = nodes('[data-message-id][data-message-author-role]').filter(visible);
@@ -70,10 +78,16 @@ export function inspectChatGPT(input, inspectDOM) {
       if (role === 'assistant' && layout === 'search-unit' && turn && assistantsInTurn.length !== 1) return fail('ambiguous_response', 'Response actions must belong to a turn with one assistant message.');
       const completedCopy = copyControls.length === 1 && visible(copyControls[0]);
       const completedActions = actionGroups.length === 1 && visible(actionGroups[0]) && nodes('button', actionGroups[0]).some(visible);
-      const content = role === 'user' && userBodies.length === 1
+      const content = role === 'user'
         ? inspectDOM({ action: 'readCopyText', element: body }) : { text: body.innerText };
+      const alerts = nodes('[role="alert"]', turn ? turn : node).filter(alert => {
+        if (!visible(alert)) return false;
+        const owner = alert.closest('[data-chatgpt-search-unit-key], [data-message-id][data-message-author-role]');
+        if (owner) return owner === node;
+        return alert.closest('[data-content-search-turn-key], [data-turn], [data-testid^="conversation-turn-"]') === turn;
+      });
       messages.push({ id, role, ...content,
-        error: turn ? nodes('[role="alert"]', turn).filter(visible).map((alert) => alert.innerText).filter(Boolean).join('\n') : '',
+        error: alerts.map(alert => alert.innerText).filter(Boolean).join('\n'),
         complete: role === 'assistant' && (completedCopy || completedActions) });
     }
     const historyScrollers = nodes('[data-app-action-timeline-scroll]').filter(visible);
@@ -106,6 +120,23 @@ export function inspectChatGPT(input, inspectDOM) {
     globalThis.chatgptRelayReviewObserver = { sample, observer, waits: new Map() };
   }
   const sample = globalThis.chatgptRelayReviewObserver.sample;
+  if (input.action === 'navigate') {
+    if (Date.now() >= input.deadlineAt) return fail('command_timeout', 'Navigation deadline expired.');
+    if (location.href !== input.expectedURL) return fail('conversation_changed', 'Conversation changed before navigation.');
+    const view = capture();
+    if (view.problem) return view;
+    if (view.draft || view.busy || view.attachments) return fail('draft_conflict', 'New user work must remain untouched.');
+    if (JSON.stringify(view.messages) !== input.expectedHistory) return fail('conversation_changed', 'Conversation changed before navigation.');
+    const destination = new URL(input.url);
+    if (destination.href === location.href) location.reload();
+    else {
+      const fragmentNavigation = destination.href.includes('#') && destination.origin === location.origin &&
+        destination.pathname === location.pathname && destination.search === location.search;
+      location.assign(input.url);
+      if (fragmentNavigation) location.reload();
+    }
+    return { navigating: true };
+  }
   if (input.action === 'scroll-history') {
     if (location.href !== input.url) return fail('conversation_changed', 'Conversation changed before reading its history.');
     const scrollers = nodes('[data-app-action-timeline-scroll]').filter(visible);

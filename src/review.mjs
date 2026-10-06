@@ -4,86 +4,326 @@ import { join } from 'node:path';
 import { prepareProfile, writePrivateJSON } from './profile.mjs';
 import { selectEffort } from './effort.mjs';
 import { Project, projectRoute } from './project.mjs';
-import { composeReviewPrompt, encodeReviewPrompt, isReviewSourcePath } from './review-files.mjs';
+import { composeReviewPrompt, encodeReviewPrompt, escapeReviewJSON, isReviewSourcePath } from './review-files.mjs';
 import { RelayError, publicError } from './protocol.mjs';
+import { reviewInlineCodeContext } from './review-inline-code.mjs';
 
 const digest = (value) => createHash('sha256').update(value).digest('hex');
+const historyErrorProof = error => error ? { error: 'visible_error', errorHash: digest(error) } : { error };
+const protectHistoryErrors = record => record.baselineHistory ? { ...record,
+  baselineHistory: record.baselineHistory.map(proof => proof.error && proof.errorHash === undefined
+    ? { ...proof, ...historyErrorProof(proof.error) } : proof) } : record;
 const historyIds = record => [...record.baselineIds,
   ...(record.userMessageId ? [record.userMessageId] : []), ...(record.responseId ? [record.responseId] : [])];
-const historyProof = (messages) => messages.map(({ id, role, text, inlineCode, complete, error }) => ({ id, role, textHash: digest(text),
-  ...(inlineCode?.length ? { formatHash: digest(JSON.stringify(inlineCode)) } : {}), complete, error }));
+const historyProof = (messages) => messages.map(({ id, role, text, inlineCode, links, complete, error }) => ({ id, role, textHash: digest(text),
+  ...(links?.length ? { formatHash: digest(JSON.stringify({ inlineCode, links })) }
+    : inlineCode?.length ? { formatHash: digest(JSON.stringify(inlineCode)) } : {}), complete, ...historyErrorProof(error) }));
 const asciiPunctuation = character => {
   const code = character?.charCodeAt(0);
   return (code >= 33 && code <= 47) || (code >= 58 && code <= 64) || (code >= 91 && code <= 96) || (code >= 123 && code <= 126);
 };
 
-function escapedLiteralEnd(source, rendered, start) {
-  let left = 0, right = start;
-  while (left < source.length) {
-    let sourceSlashes = 0, renderedSlashes = 0;
-    while (source[left] === '\\') { left++; sourceSlashes++; }
-    while (rendered[right] === '\\') { right++; renderedSlashes++; }
-    if (renderedSlashes < sourceSlashes || renderedSlashes > sourceSlashes * 2 + Number(asciiPunctuation(source[left]))) return null;
-    if (left === source.length) return right;
-    if (source[left] !== rendered[right]) return null;
-    left++; right++;
+const linkDestination = label => {
+  if (!/^https?:\/\//.test(label)) return null;
+  try { return new URL(label).href; } catch { return null; }
+};
+
+const promptRepresentations = prompt => {
+  const unicode = escapeReviewJSON(prompt);
+  return [prompt, encodeReviewPrompt(prompt), unicode, encodeReviewPrompt(unicode)];
+};
+
+function* literalPrefixes(source, left, rendered, right, to = rendered.length) {
+  yield { at: right, lo: left, hi: left };
+  while (right < to) {
+    let a = left, b = right;
+    while (source[a] === '\\') a++;
+    while (b < to && rendered[b] === '\\') b++;
+    const k = a - left, j = b - right;
+    if (j) {
+      const lo = left + Math.ceil(j / 2);
+      const hi = left + Math.min(k, j);
+      if (lo <= hi) yield { at: b, lo, hi };
+    }
+    if (b === to) return;
+    if (j < k || j > 2 * k + Number(asciiPunctuation(source[a])) ||
+        source[a] !== rendered[b]) return;
+    left = a + 1;
+    right = b + 1;
+    yield { at: right, lo: left, hi: left };
   }
-  return right;
 }
 
-function matchesRenderedText(source, rendered, inlineCode = []) {
-  let left = 0, right = 0, codeIndex = 0;
-  if (inlineCode.some((span, index) => !Number.isInteger(span.start) || !Number.isInteger(span.end) ||
-    span.start < (index ? inlineCode[index - 1].end : 0) || span.end < span.start || span.end > rendered.length)) return false;
-  while (left < source.length || right < rendered.length) {
-    const code = inlineCode[codeIndex];
-    if (code?.start === right && source[left] !== '`') {
-      codeIndex++;
-      continue;
-    }
-    if (code?.start === right) {
-      if (source[left - 1] === '`') return false;
-      let width = 0;
-      while (source[left + width] === '`') width++;
-      if (!width) return false;
-      let end = left + width;
-      while (true) {
-        end = source.indexOf('`', end);
-        if (end === -1) return false;
-        let closingWidth = 0;
-        while (source[end + closingWidth] === '`') closingWidth++;
-        if (closingWidth === width) break;
-        end += closingWidth;
-      }
-      let literal = source.slice(left + width, end).replace(/\r\n|\r|\n/g, ' ');
-      if (literal.startsWith(' ') && literal.endsWith(' ') && /[^ ]/.test(literal)) literal = literal.slice(1, -1);
-      if (rendered.slice(code.start, code.end) !== literal) return false;
-      left = end + width; right = code.end; codeIndex++;
-      continue;
-    }
-    if (rendered[right] === '[' && (source.startsWith('https://', left) || source.startsWith('http://', left))) {
-      const sourceURL = source.slice(left).match(/^https?:\/\/[^\s"<>]+/)?.[0];
-      if (sourceURL) {
-        const labelEnd = escapedLiteralEnd(sourceURL, rendered, right + 1);
-        if (labelEnd !== null && rendered.startsWith('](', labelEnd)) {
-          const destinationEnd = escapedLiteralEnd(sourceURL, rendered, labelEnd + 2);
-          if (destinationEnd !== null && rendered[destinationEnd] === ')') {
-            left += sourceURL.length;
-            right = destinationEnd + 1;
-            continue;
-          }
-        }
-      }
-    }
-    let sourceSlashes = 0, renderedSlashes = 0;
-    while (source[left] === '\\') { left++; sourceSlashes++; }
-    while (rendered[right] === '\\' && right !== code?.start) { right++; renderedSlashes++; }
-    if (renderedSlashes < sourceSlashes || renderedSlashes > sourceSlashes * 2 + Number(asciiPunctuation(source[left]))) return false;
-    if (code?.start === right) continue;
-    if (source[left] !== rendered[right]) return false;
-    left++; right++;
+function literalRange(source, left, rendered, from, to) {
+  for (const span of literalPrefixes(source, left, rendered, from, to))
+    if (span.at === to) return span;
+  return null;
+}
+
+function textIndex(text, indexOpen = false) {
+  const count = new Uint32Array(text.length + 1);
+  let slashRuns = 0;
+  for (let i = 0; i < text.length; i++) {
+    count[i + 1] = count[i] + Number(text[i] !== '\\');
+    if (text[i] !== '\\' && text[i - 1] === '\\') slashRuns++;
   }
-  return codeIndex === inlineCode.length;
+  const size = count[text.length], chars = text.replaceAll('\\', '');
+  const positions = new Uint32Array(size), runs = new Uint32Array(size);
+  const realRuns = new Uint32Array(slashRuns), bad = new Uint32Array(size + 1);
+  let slashes = 0, token = 0, run = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\\') { slashes++; continue; }
+    positions[token] = i;
+    runs[token] = slashes;
+    if (slashes) realRuns[run++] = token;
+    bad[token + 1] =
+      bad[token] + Number(slashes > Number(asciiPunctuation(text[i])));
+    slashes = 0;
+    token++;
+  }
+  let nextOpen;
+  if (indexOpen) {
+    nextOpen = new Uint32Array(text.length + 1);
+    nextOpen[text.length] = text.length;
+    for (let i = text.length - 1; i >= 0; i--)
+      nextOpen[i] = text[i] === '[' ? i : nextOpen[i + 1];
+  }
+  return { chars, positions, runs, realRuns, count, bad, nextOpen };
+}
+
+function zValues(pattern, text) {
+  const split = pattern.length, size = split + 1 + text.length;
+  const at = i => i < split ? pattern.charCodeAt(i)
+    : i === split ? -1 : text.charCodeAt(i - split - 1);
+  const z = new Uint32Array(size);
+  for (let i = 1, l = 0, r = 0; i < size; i++) {
+    if (i < r) z[i] = Math.min(r - i, z[i - l]);
+    while (i + z[i] < size && at(z[i]) === at(i + z[i])) z[i]++;
+    if (i + z[i] > r) { l = i; r = i + z[i]; }
+  }
+  return z;
+}
+
+function lowerBound(values, target) {
+  let lo = 0, hi = values.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (values[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function hrefSourceEnd(source, start, range, href) {
+  const first = linkDestination(source.slice(start, range.lo));
+  if (first === null) return null;
+  if (range.lo === range.hi) return first === href ? range.lo : null;
+  const end = range.lo + href.length - first.length;
+  if (end < range.lo || end > range.hi) return null;
+  const destination = end === range.lo
+    ? first : linkDestination(source.slice(start, end));
+  return destination === href ? end : null;
+}
+
+function indexedDestination(
+  source, rendered, si, ri, start, candidate, from, to, z, zBase, textBase
+) {
+  const a = si.count[start], len = si.count[candidate.lo] - a;
+  const b = ri.count[from], entry = zBase + b - textBase;
+  if (entry >= z.length || z[entry] < len || ri.positions[b] !== from)
+    return null;
+
+  let proof;
+  const validEscapes = () => {
+    if (proof !== undefined) return proof;
+    let bad = ri.bad[b + len] - ri.bad[b];
+    for (let i = lowerBound(si.realRuns, a + 1); i < si.realRuns.length; i++) {
+      const token = si.realRuns[i];
+      if (token >= a + len) break;
+      const target = b + token - a, k = si.runs[token], j = ri.runs[target];
+      bad -= Number(j > Number(asciiPunctuation(si.chars[token])));
+      if (j < k || j > 2 * k + Number(asciiPunctuation(si.chars[token])))
+        return proof = false;
+    }
+    return proof = bad === 0;
+  };
+
+  const trailing = to - (ri.positions[b + len - 1] + 1);
+  if (source[candidate.lo - 1] !== '\\')
+    return trailing === 0 ? { ...candidate, validEscapes } : null;
+  let base = candidate.lo;
+  while (source[base - 1] === '\\') base--;
+  const lo = Math.max(candidate.lo, base + Math.ceil(trailing / 2));
+  const hi = Math.min(candidate.hi, base + trailing);
+  return lo <= hi ? { lo, hi, validEscapes } : null;
+}
+
+function matchesRenderedText(
+  source, rendered, inlineCode = [], links = [], codeAt, sourceOffset = 0
+) {
+  if (inlineCode.some((span, i) =>
+    !Number.isInteger(span.start) || !Number.isInteger(span.end) ||
+    span.start < (i ? inlineCode[i - 1].end : 0) ||
+    span.end < span.start || span.end > rendered.length)) return false;
+  if (links.some((span, i) =>
+    !Number.isInteger(span.start) || !Number.isInteger(span.end) ||
+    typeof span.href !== 'string' ||
+    span.start < (i ? links[i - 1].end : 0) ||
+    span.end <= span.start || span.end > rendered.length)) return false;
+
+  let si, ri;
+  function* edges(state) {
+    let [left, right, ci, li] = state;
+    while (left < source.length || right < rendered.length) {
+      const code = inlineCode[ci], link = links[li];
+      if (code?.start === right && source[left] !== '`') { ci++; continue; }
+      if (link?.start < right || code?.start < right) return;
+
+      if (link?.start === right &&
+          !(code?.start === right && source[left] === '`')) {
+        const range = literalRange(source, left, rendered, right, link.end);
+        if (!range) return;
+        const end = hrefSourceEnd(source, left, range, link.href);
+        if (end !== null) yield { state: [end, link.end, ci, li + 1] };
+        return;
+      }
+
+      if (code?.start === right) {
+        const original = typeof codeAt === 'function' &&
+          codeAt(left - sourceOffset);
+        if (!original) return;
+        const start = original.contentStart + sourceOffset;
+        const end = original.contentEnd + sourceOffset;
+        let literal = '';
+        for (let p = start; p < end; p++) {
+          const c = source[p];
+          if (c === '\r' && source[p + 1] === '\n') p++;
+          literal += c === '\r' || c === '\n' ? ' ' : c;
+        }
+        if (literal.startsWith(' ') && literal.endsWith(' ') &&
+            /[^ ]/.test(literal)) literal = literal.slice(1, -1);
+        if (rendered.slice(code.start, code.end) !== literal) return;
+        while (links[li]?.start < code.end) {
+          const span = links[li];
+          if (span.start < code.start || span.end > code.end ||
+              linkDestination(literal.slice(
+                span.start - code.start, span.end - code.start
+              )) !== span.href) return;
+          li++;
+        }
+        yield { state: [original.end + sourceOffset, code.end, ci + 1, li] };
+        return;
+      }
+
+      if (rendered[right] === '[' &&
+          (source.startsWith('https://', left) ||
+           source.startsWith('http://', left))) {
+        si ??= textIndex(source);
+        ri ??= textIndex(rendered, true);
+        let last;
+        for (const span of literalPrefixes(source, left, rendered, right + 1))
+          if (rendered.startsWith('](', span.at)) last = span;
+        if (!last) return;
+
+        const a = si.count[left], textBase = ri.count[right];
+        const len = si.count[last.lo] - a;
+        const z = zValues(
+          si.chars.slice(a, a + len),
+          ri.chars.slice(textBase, textBase + 2 * len + 4)
+        );
+
+        for (const candidate of literalPrefixes(
+          source, left, rendered, right + 1
+        )) {
+          if (!rendered.startsWith('](', candidate.at)) continue;
+          const size = si.count[candidate.lo] - a;
+          const from = candidate.at + 2, token = ri.count[from] + size;
+          const to = token < ri.positions.length
+            ? ri.positions[token] : undefined;
+          if (to === undefined || rendered[to] !== ')') continue;
+          const after = to + 1;
+          if (ci === inlineCode.length &&
+              ri.nextOpen[after] === rendered.length &&
+              si.chars.length - si.count[candidate.lo] !==
+                ri.chars.length - ri.count[after]) continue;
+
+          const range = indexedDestination(
+            source, rendered, si, ri, left, candidate,
+            from, to, z, len + 1, textBase
+          );
+          if (!range) continue;
+          for (let end = range.lo; end <= range.hi; end++)
+            yield {
+              state: [end, after, ci, li],
+              check: () => range.validEscapes() &&
+                linkDestination(source.slice(left, end)) !== null,
+            };
+        }
+        return;
+      }
+
+      let a = left, b = right;
+      while (source[a] === '\\') a++;
+      while (rendered[b] === '\\' &&
+             b !== code?.start && b !== link?.start) b++;
+      const k = a - left, j = b - right;
+      if (b === link?.start && j) {
+        const lo = left + Math.ceil(j / 2);
+        const hi = left + Math.min(k, j);
+        for (let end = lo; end <= hi; end++)
+          yield { state: [end, b, ci, li] };
+        return;
+      }
+      if (j < k || j > 2 * k + Number(asciiPunctuation(source[a]))) return;
+      if (code?.start === b) {
+        yield { state: [a, b, ci, li] };
+        return;
+      }
+      if (a === source.length && b === rendered.length) {
+        yield { complete: ci === inlineCode.length && li === links.length };
+        return;
+      }
+      if (source[a] !== rendered[b]) return;
+      left = a + 1;
+      right = b + 1;
+    }
+    yield { complete: ci === inlineCode.length && li === links.length };
+  }
+
+  const key = state => state.join(',');
+  const memo = new Map(), initial = [0, 0, 0, 0];
+  const stack = [{ key: key(initial), iter: edges(initial) }];
+  while (stack.length) {
+    const frame = stack.at(-1);
+    let edge = frame.pending;
+    if (edge) {
+      frame.pending = undefined;
+      if (memo.get(key(edge.state)) &&
+          (edge.check === undefined || edge.check())) {
+        memo.set(frame.key, true);
+        stack.pop();
+        continue;
+      }
+    }
+    const next = frame.iter.next();
+    if (next.done) {
+      memo.set(frame.key, false);
+      stack.pop();
+      continue;
+    }
+    edge = next.value;
+    if (edge.complete) {
+      memo.set(frame.key, true);
+      stack.pop();
+      continue;
+    }
+    if (!edge.state) continue;
+    const childKey = key(edge.state);
+    frame.pending = edge;
+    if (!memo.has(childKey))
+      stack.push({ key: childKey, iter: edges(edge.state) });
+  }
+  return memo.get(key(initial)) === true;
 }
 
 const requestMessages = (record, messages) => messages.filter(message => message.role === 'user' &&
@@ -91,8 +331,12 @@ const requestMessages = (record, messages) => messages.filter(message => message
     matchesRenderedText(`Review request UUID: ${record.id}`, message.text.split('\n', 1)[0])));
 
 function assertRequestContent(record, message) {
-  if (!matchesRenderedText(record.prompt, message.text, message.inlineCode) &&
-      !matchesRenderedText(encodeReviewPrompt(record.prompt), message.text, message.inlineCode)) {
+  let inlineContext;
+  const codeAt = offset => (inlineContext ??= reviewInlineCodeContext(record.prompt)).get(offset);
+  const payloadStart = record.prompt.indexOf('\n{"id":');
+  if (!promptRepresentations(record.prompt).some((prompt, index) => matchesRenderedText(prompt, message.text,
+    message.inlineCode, message.links, index < 2 ? codeAt : undefined,
+    index === 1 ? prompt.indexOf('\n{"id":') - payloadStart : 0))) {
     throw new RelayError('review_content_mismatch', 'The identified request body differs from the verified input beyond supported display escaping.');
   }
 }
@@ -122,7 +366,7 @@ export class Reviews {
   }
 
   get(id) {
-    try { return JSON.parse(readFileSync(join(this.directory, `${id}.json`), 'utf8')); }
+    try { return protectHistoryErrors(JSON.parse(readFileSync(join(this.directory, `${id}.json`), 'utf8'))); }
     catch (error) {
       if (error.code === 'ENOENT') throw new RelayError('review_missing', 'No review is recorded for this ID.', 404);
       throw error;
@@ -130,7 +374,7 @@ export class Reviews {
   }
 
   save(record, update, exclusive = false) {
-    const next = { ...record, ...update, updatedAt: new Date().toISOString() };
+    const next = protectHistoryErrors({ ...record, ...update, updatedAt: new Date().toISOString() });
     writePrivateJSON(join(this.directory, `${record.id}.json`), next, exclusive);
     return next;
   }
@@ -232,6 +476,7 @@ export class Reviews {
     }
     const user = matches[0], position = view.messages.indexOf(user);
     assertRequestContent(previous, user);
+    if (user.error) throw new RelayError('response_failed', 'The previous request has a visible error; its delivery cannot be confirmed.');
     this.assertBaseline(previous, view.messages.slice(0, position));
     const following = view.messages.slice(position + 1);
     if (following.length > 1 || following.some(message => message.role !== 'assistant')) {
@@ -254,7 +499,7 @@ export class Reviews {
         !(previous.userMessageId && canonicalizesConversation(previous.conversationURL, view.url))) {
       this.assertReady(view);
       this.project.assertURL(project, previous.conversationURL);
-      await this.browser.execute({ action: 'navigate', url: previous.conversationURL }, signal, deadlineAt);
+      await this.browser.navigateReview(previous.conversationURL, view, signal, deadlineAt);
       while (true) {
         view = await this.browser.reviewView(signal);
         this.project.assertURL(project, view.url);
@@ -305,9 +550,9 @@ export class Reviews {
         throw new RelayError('project_changed', 'Resume requires the originally recorded project binding.');
       }
       let before = await this.browser.reviewView(signal);
-      const encodedPrompt = encodeReviewPrompt(record.prompt);
+      const encodedPrompt = encodeReviewPrompt(escapeReviewJSON(record.prompt));
       const resumeDraft = (['preparing', 'failed'].includes(record.state) || knownUnsent) &&
-        (before.draft === record.prompt || before.draft === encodedPrompt);
+        promptRepresentations(record.prompt).includes(before.draft);
       const submittedText = resumeDraft ? before.draft : encodedPrompt;
       this.assertReady(before, resumeDraft ? submittedText : '');
       const previous = this.previous(record);
@@ -433,8 +678,8 @@ export class Reviews {
     const answers = following.filter((message) => message.role === 'assistant');
     if (answers.length > 1) throw new RelayError('ambiguous_response', 'Multiple assistant messages follow the review.');
     const answer = answers[0];
-    const responseError = [user, ...following].map((message) => message.error).filter(Boolean).join('\n');
-    if (responseError) throw new RelayError('response_failed', responseError);
+    if (user.error) throw new RelayError('response_failed', 'The review request has a visible error; its delivery cannot be confirmed.');
+    if (following.some(message => message.error)) throw new RelayError('response_failed', 'The assistant response has a visible error; review completion cannot be confirmed.');
     if (!answer || view.busy || !answer.complete) return { ...binding, state: 'generating' };
     if (answer.text.trimEnd().split('\n').at(-1) !== `END-OF-REVIEW:${record.id}`) {
       return { ...binding, state: 'response_incomplete', responseId: answer.id };
@@ -466,7 +711,7 @@ export class Reviews {
       }
       this.project.assertURL(project, record.conversationURL);
       this.assertReady(view);
-      await this.browser.execute({ action: 'navigate', url: record.conversationURL }, signal, deadlineAt);
+      await this.browser.navigateReview(record.conversationURL, view, signal, deadlineAt);
       while (true) {
         view = await this.browser.reviewView(signal);
         this.project.assertURL(project, view.url);

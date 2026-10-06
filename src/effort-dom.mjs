@@ -6,8 +6,10 @@ export function inspectEffort(input) {
     if (nodes.length !== 1) fail(`Expected one effort control: ${selector}`);
     return nodes[0];
   };
+  const scopeNode = target => unique(target.scope ? scopeNode(target.scope) : document,
+    `[${target.attribute}="${CSS.escape(target.value)}"]`, false);
   const triggerNode = () => {
-    const scope = unique(document, `[${input.trigger.scope.attribute}="${CSS.escape(input.trigger.scope.value)}"]`, false);
+    const scope = scopeNode(input.trigger.scope);
     return unique(scope, '[data-codex-intelligence-trigger="true"]');
   };
   const read = () => {

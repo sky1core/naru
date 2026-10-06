@@ -1,13 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { mkdir, mkdtemp, readFile } from 'node:fs/promises';
+import { randomUUID, createHash } from 'node:crypto';
+import { resolve, join } from 'node:path';
 import { Reviews } from '../src/review.mjs';
 import { Project } from '../src/project.mjs';
 import { RelayError, requestSchema } from '../src/protocol.mjs';
+import { encodeReviewPrompt, escapeReviewJSON } from '../src/review-files.mjs';
+import { Journal } from '../src/journal.mjs';
 
-async function setup() {
+async function setup(question = 'Keep the original material.') {
   await mkdir('artifacts/recovery-unit-runs', { recursive: true });
   const profile = await mkdtemp(resolve('artifacts/recovery-unit-runs/run-'));
   const projectId = 'g-p-0123456789abcdef0123456789abcdef';
@@ -21,6 +23,7 @@ async function setup() {
     assertActive(signal) { if (signal?.aborted) throw new RelayError('command_timeout', 'Execution deadline expired.', 504); },
     status: () => ({ documentId }), reviewView: async () => ({ ...structuredClone(view), inputHistory: JSON.stringify(view.messages) }),
     snapshot: async () => ({ elements: [{ attributes: { 'data-app-action-sidebar-project-id': projectId } }] }),
+    async navigateReview(url, _view, signal, deadlineAt) { return this.execute({ action: 'navigate', url }, signal, deadlineAt); },
     async execute(command, signal, _deadlineAt, beforeDispatch) {
       this.assertActive(signal); effects.push(command.action);
       if (command.action === 'navigate') view.url = command.url;
@@ -38,10 +41,143 @@ async function setup() {
   };
   await new Project(profile, browser).bind(documentId);
   const reviews = new Reviews(profile, browser);
-  const record = reviews.prepare({ reviewId: randomUUID(), question: 'Keep the original material.', files: [] });
+  const record = reviews.prepare({ reviewId: randomUUID(), question, files: [] });
   const submit = signal => reviews.submit(record.id, documentId, signal, Date.now() + 30000);
   return { reviews, record, view, browser, effects, submit };
 }
+
+test('receipt recovery rejects failed source delivery and preserves recovery after an answer failure', async t => {
+  const marker = 'SYNTHETIC_PRIVATE_SOURCE token=SYNTHETIC_SECRET';
+  for (const failure of ['request', 'answer']) await t.test(failure, async () => {
+    const { reviews, view, browser, effects } = await setup();
+    const documentId = browser.status().documentId;
+    const execute = browser.execute.bind(browser);
+    let failedId;
+    browser.execute = async (...args) => {
+      const result = await execute(...args);
+      if (args[0].action === 'click') {
+        const user = view.messages.at(-2), answer = view.messages.at(-1);
+        const id = user.text.match(/Review request UUID: ([a-f0-9-]+)/)[1];
+        const part = reviews.get(id).part;
+        answer.text = `PART-RECEIVED:${part.index}/${part.total}:${id}\nEND-OF-REVIEW:${id}`;
+        if (id === failedId) (failure === 'request' ? user : answer).error = marker;
+        view.url = reviews.get(id).startURL.replace('/project', '/c/original');
+      }
+      return result;
+    };
+    const link = record => ({ reviewId: record.id, promptHash: record.promptHash,
+      ...(record.answerHash ? { answerHash: record.answerHash } : {}) });
+    const submit = async record => { await reviews.submit(record.id, documentId, undefined, Date.now() + 30000); return reviews.collect(record.id, 0); };
+    const first = await submit(reviews.prepare({ reviewId: randomUUID(), question: 'First part', files: [], part: { index: 1, total: 3 } }));
+    const source = 'private source in the second part';
+    const second = reviews.prepare({ reviewId: randomUUID(), question: 'Second source part', files: [
+      { path: 'source.txt', content: source, bytes: Buffer.byteLength(source), sha256: createHash('sha256').update(source).digest('hex') },
+    ],
+      part: { index: 2, total: 3 }, continueFrom: link(first) });
+    failedId = second.id;
+    await assert.rejects(submit(second), { code: 'response_failed' });
+    const recovery = reviews.prepare({ reviewId: randomUUID(), question: 'Recover receipt', files: [],
+      part: { index: 2, total: 3 }, continueFrom: link(reviews.get(second.id)) });
+    const priorEffects = effects.length;
+    if (failure === 'request') {
+      await assert.rejects(submit(recovery), { code: 'response_failed' });
+      assert.equal(effects.length, priorEffects);
+      assert.equal(reviews.get(second.id).continuedBy, undefined);
+    } else {
+      const completed = await submit(recovery);
+      assert.equal(completed.state, 'completed');
+      assert(!JSON.stringify(completed).includes('SYNTHETIC_PRIVATE_SOURCE'));
+      assert(!JSON.stringify(completed).includes('SYNTHETIC_SECRET'));
+      const profile = resolve(reviews.directory, '..');
+      const journal = new Journal(profile);
+      const { record } = journal.begin(randomUUID(), { command: { action: 'review.collect', reviewId: recovery.id, waitMs: 0 } });
+      journal.finish(record, { state: 'completed', result: completed }, { reviewId: recovery.id });
+      const stored = await readFile(join(profile, 'requests', `${record.id}.json`), 'utf8');
+      assert(!stored.includes('SYNTHETIC_PRIVATE_SOURCE'));
+      assert(!stored.includes('SYNTHETIC_SECRET'));
+    }
+  });
+});
+
+test('continuation verifies ancestors when legacy and Unicode renderings change after the baseline was recorded', async () => {
+  const represent = prompt => {
+    const unicode = escapeReviewJSON(prompt);
+    return [prompt, encodeReviewPrompt(prompt), unicode, encodeReviewPrompt(unicode)];
+  };
+  for (let index = 0; index < 4; index++) {
+    for (const altered of [false, true]) {
+      const { reviews, record, view, browser, effects, submit } = await setup();
+      await submit();
+      const previous = await reviews.collect(record.id, 0);
+      const variants = represent(previous.prompt);
+      view.messages[0].text = variants[index];
+      const firstURL = view.url;
+      const execute = browser.execute.bind(browser);
+      browser.execute = async (...args) => {
+        const result = await execute(...args);
+        if (args[0].action === 'click') view.url = firstURL;
+        return result;
+      };
+      const next = reviews.prepare({ reviewId: randomUUID(), question: 'Continue the verified source.', files: [],
+        continueFrom: { reviewId: previous.id, promptHash: previous.promptHash, answerHash: previous.answerHash } });
+      await reviews.submit(next.id, browser.status().documentId, undefined, Date.now() + 30000);
+      const effectCount = effects.length;
+      view.messages[0].text = variants[(index + 1) % variants.length];
+      if (altered) view.messages[0].text = view.messages[0].text.replace('original material', 'changed material');
+      if (altered) {
+        await assert.rejects(reviews.collect(next.id, 0), { code: 'review_content_mismatch' });
+        assert.equal(reviews.get(next.id).answer, undefined);
+      } else {
+        const completed = await reviews.collect(next.id, 0);
+        assert.equal(completed.state, 'completed');
+        assert.equal(completed.promptHash, next.promptHash);
+        assert.equal(reviews.get(previous.id).promptHash, previous.promptHash);
+        assert.equal(reviews.get(previous.id).answerHash, previous.answerHash);
+      }
+      assert.equal(effects.length, effectCount);
+    }
+  }
+});
+
+test('ancestor revalidation preserves source across link display changes and rejects mismatched destinations', async t => {
+  const url = 'https://source.example/file.';
+  for (const content of [
+    ['Text', '```js', 'const marker = "```";', `const url = "${url}";`, '```'].join('\n'),
+    `Read 'Use "${url}" here' now.`,
+    `const marker = "'"; const url = '${url}';`,
+    `const marker = '"'; const url = "${url}";`,
+    `Read "https://source.example/a\`b." then "${url}" and \`end\`.`,
+    `'docs'를 보고:'${url}'`,
+  ]) await t.test(content, async () => {
+    const { reviews, record, view, browser, effects, submit } = await setup(content);
+    await submit();
+    const user = view.messages[0];
+    user.text = record.prompt;
+    const start = user.text.indexOf(url);
+    user.links = [{ start, end: start + url.length, href: url }];
+    const previous = await reviews.collect(record.id, 0);
+    const conversationURL = view.url;
+    const execute = browser.execute.bind(browser);
+    browser.execute = async (...args) => {
+      const result = await execute(...args);
+      if (args[0].action === 'click') view.url = conversationURL;
+      return result;
+    };
+    const next = reviews.prepare({ reviewId: randomUUID(), question: 'Continue the original source.', files: [],
+      continueFrom: { reviewId: previous.id, promptHash: previous.promptHash, answerHash: previous.answerHash } });
+    await reviews.submit(next.id, browser.status().documentId, undefined, Date.now() + 30000);
+    const effectsBefore = effects.length;
+    user.links = [{ start, end: start + url.length - 1, href: url }];
+    await assert.rejects(reviews.collect(next.id, 0), { code: 'review_content_mismatch' });
+    assert.equal(reviews.get(next.id).answer, undefined);
+    user.links[0].href = url.slice(0, -1);
+    const completed = await reviews.collect(next.id, 0);
+    assert.equal(completed.state, 'completed');
+    assert.equal(user.text, record.prompt);
+    assert.equal(reviews.get(record.id).promptHash, record.promptHash);
+    assert.equal(effects.length, effectsBefore);
+  });
+});
 
 test('interrupted preparation resumes its original identity with an empty or exact draft', async () => {
   for (const draft of ['empty', 'exact']) {
@@ -49,9 +185,11 @@ test('interrupted preparation resumes its original identity with an empty or exa
     reviews.save(record, { state: 'preparing', startURL: view.url, baselineIds: [] });
     if (draft === 'exact') view.draft = record.prompt;
     assert.equal((await submit()).state, 'submitted');
-    const expected = draft === 'exact' ? record.prompt : record.prompt.replace(/^(\{"id":.*\})$/m, '```json\n$1\n```');
+    const expected = draft === 'exact' ? record.prompt : encodeReviewPrompt(escapeReviewJSON(record.prompt));
     assert.equal(view.messages[0].text, expected);
     assert.equal(reviews.get(record.id).promptHash, record.promptHash);
+    const payload = view.messages[0].text.split('\n').find(line => line.startsWith('{"id":'));
+    assert.deepEqual(JSON.parse(payload), JSON.parse(record.prompt.split('\n').find(line => line.startsWith('{"id":'))));
     assert.equal(effects.filter(action => action === 'fill').length, draft === 'exact' ? 0 : 1);
     await submit();
     assert.equal(view.messages.filter(message => message.role === 'user').length, 1);

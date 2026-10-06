@@ -1,5 +1,5 @@
 export function inspectDOM(input) {
-  const attributes = ['id', 'data-testid', 'name', 'type', 'href', 'data-message-id', 'data-message-author-role', 'data-composer-markdown', 'data-chatgpt-composer', 'data-composer-placement', 'data-app-action-sidebar-project-id', 'data-codex-intelligence-trigger', 'data-model-picker-view-toggle', 'data-map-composer-conversation', 'data-reasoning-slider', 'data-model-picker-view'];
+  const attributes = ['id', 'data-testid', 'name', 'type', 'href', 'data-message-id', 'data-message-author-role', 'data-composer-markdown', 'data-chatgpt-composer', 'data-composer-placement', 'data-app-action-sidebar-project-id', 'data-codex-intelligence-trigger', 'data-model-picker-view-toggle', 'data-map-composer-conversation', 'data-app-shell-active-page', 'data-reasoning-slider', 'data-model-picker-view'];
   const failure = (code, message) => ({ error: { code, message } });
   const matches = (target) => {
     const roots = target.scope ? matches(target.scope) : [document];
@@ -11,6 +11,7 @@ export function inspectDOM(input) {
     const parentVisible = getComputedStyle(parent).visibility === 'visible';
     let result = '';
     const inlineCode = [];
+    const links = [];
     let previousBlock = false;
     let seen = false;
     for (const node of parent.childNodes) {
@@ -42,12 +43,17 @@ export function inspectDOM(input) {
         } else {
           inlineCode.push(...child.inlineCode.map(span => ({ start: result.length + span.start, end: result.length + span.end })));
         }
+        if (copyContent && childText.length && node.tagName === 'A' && node.hasAttribute('href')) {
+          links.push({ start: result.length, end: result.length + childText.length, href: node.href });
+        } else if (child.links) {
+          links.push(...child.links.map(span => ({ ...span, start: result.length + span.start, end: result.length + span.end })));
+        }
         result += childText;
         previousBlock = block;
         seen = true;
       }
     }
-    return { text: result, inlineCode };
+    return { text: result, inlineCode, ...(links.length ? { links } : {}) };
   };
   const text = (element) => {
     if (element instanceof HTMLInputElement && element.type === 'password') throw new Error('password_field');
@@ -148,7 +154,7 @@ export function inspectDOM(input) {
     if (input.effortToken && (globalThis.naruEffortReceipt?.token !== input.effortToken || !globalThis.naruEffortReceipt.verify())) return false;
     if (input.expectedHistory !== undefined) {
       const view = globalThis.chatgptRelayReviewObserver?.sample();
-      if (!view || view.problem || view.busy || (view.historyScrollable && view.historyAtLatest !== true) ||
+      if (!view || view.problem || view.busy || view.attachments || (view.historyScrollable && view.historyAtLatest !== true) ||
           JSON.stringify(view.messages) !== input.expectedHistory) return false;
     }
     if (!input.expectedText) return true;

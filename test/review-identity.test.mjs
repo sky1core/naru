@@ -4,6 +4,7 @@ import { mkdir, mkdtemp } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { Reviews } from '../src/review.mjs';
+import { encodeReviewPrompt, escapeReviewJSON } from '../src/review-files.mjs';
 
 const hash = text => createHash('sha256').update(text).digest('hex');
 const project = { id: 'g-p-0123456789abcdef0123456789abcdef', origin: 'https://example.com' };
@@ -35,6 +36,53 @@ test('collect recognizes the sent UUID when the rendered body escapes punctuatio
   assert.equal(completed.promptHash, record.promptHash);
   assert.deepEqual(completed.sources, record.sources);
   assert.equal((await new Reviews(profile, browser).collect(record.id, 0)).answer, completed.answer);
+});
+
+test('legacy and Unicode plain or fenced requests retain identity, bytes and hashes through checkpoint recovery', async () => {
+  const source = 'npm @scope/package https://source.example/(path) `code` **bold** literal \\u0040 \\*\r\n한글🙂';
+  for (const state of ['submitted', 'uncertain', 'send_attempted']) {
+    for (const kind of ['plain', 'fenced', 'unicode', 'unicode-fenced']) {
+      for (const altered of [false, true]) {
+        const { reviews, record, view, browser, profile } = await context(source);
+        const unicode = escapeReviewJSON(record.prompt);
+        const variants = { plain: record.prompt, fenced: encodeReviewPrompt(record.prompt),
+          unicode, 'unicode-fenced': encodeReviewPrompt(unicode) };
+        const text = variants[kind];
+        const payload = text.split('\n').find(line => line.startsWith('{"id":'));
+        const parsed = JSON.parse(payload);
+        assert.equal(parsed.files[0].content, source);
+        assert.equal(Buffer.byteLength(parsed.files[0].content), record.sources[0].bytes);
+        assert.equal(hash(parsed.files[0].content), record.sources[0].sha256);
+        reviews.save(reviews.get(record.id), { state, userMessageId: view.messages[0].id, conversationURL: view.url });
+        view.messages[0].text = altered ? text.replace('scope', 'other') : text;
+        browser.execute = async () => { assert.fail('Recovery must not replay input.'); };
+        const restored = new Reviews(profile, browser);
+        if (altered) {
+          await assert.rejects(restored.collect(record.id, 0), { code: 'review_content_mismatch' });
+          assert.equal(restored.get(record.id).answer, undefined);
+        } else {
+          const completed = await restored.collect(record.id, 0);
+          assert.equal(completed.state, 'completed');
+          assert.equal(completed.prompt, record.prompt);
+          assert.equal(completed.promptHash, record.promptHash);
+          assert.deepEqual(completed.sources, record.sources);
+          browser.reviewView = async () => { assert.fail('Completed checkpoints use the verified result.'); };
+          assert.equal((await restored.collect(record.id, 0)).answerHash, completed.answerHash);
+        }
+      }
+    }
+  }
+});
+
+test('Unicode transmission rejects a decoded but transformed URL or npm scope display', async () => {
+  for (const change of [text => text.replace('@scope/package', '@scope'),
+    text => text.replace('https://source.example/path', 'https://source.example'),
+    text => text.replace('https://source.example/path', 'https://changed.example/path')]) {
+    const { reviews, record, view } = await context('npm @scope/package https://source.example/path');
+    view.messages[0].text = change(record.prompt);
+    await assert.rejects(reviews.collect(record.id, 0), { code: 'review_content_mismatch' });
+    assert.equal(reviews.get(record.id).answer, undefined);
+  }
 });
 
 test('successful collection clears the current error and retains failure history without replaying input', async () => {
@@ -99,12 +147,99 @@ test('editor autolinks preserve the complete URL in both label and destination, 
   }
 });
 
-test('autolink wrappers cannot shorten a source URL or insert an empty link', async () => {
+test('DOM links preserve exact destinations both inside and outside inline code', async () => {
+  const url = 'https://example.com/path?x=1&y=2';
+  for (const code of ['none', 'source', 'display']) for (const changed of [false, true]) {
+    const { reviews, record, view } = await context(code === 'source' ? `Read \`${url}\` here` : `Read ${url} here`);
+    const message = view.messages[0];
+    message.text = code === 'source' ? record.prompt.replace(`\`${url}\``, url) : record.prompt;
+    const start = message.text.indexOf(url), end = start + url.length;
+    if (code !== 'none') message.inlineCode = [{ start, end }];
+    message.links = [{ start, end, href: changed ? 'https://changed.example/path' : new URL(url).href }];
+    if (changed) await assert.rejects(reviews.collect(record.id, 0), { code: 'review_content_mismatch' });
+    else assert.equal((await reviews.collect(record.id, 0)).state, 'completed');
+  }
+});
+
+test('URL display ranges preserve the exact body and matching destination', async () => {
+  for (const url of ['https://source.example/path', 'https://source.example/(part)/path', 'https://source.example/part_(nested(one))']) {
+    for (const wrap of [value => `(${value})`, value => `(see ${value})`, value => `'${value}'`,
+      value => `\`${value}\``, value => `${value}.`, value => `${value},`]) {
+      for (const display of ['dom', 'wrapper', 'inline']) {
+        for (const alteration of ['none', 'href', 'prefix', 'body']) {
+          const { reviews, record, view } = await context(`Review ${wrap(url)} now.`);
+          const message = view.messages[0];
+          message.text = record.prompt;
+          if (display === 'wrapper') message.text = message.text.replace(url, `[${url}](${alteration === 'href' ? url + '#changed' : url})`);
+          else {
+            if (display === 'inline') {
+              const raw = `\`${url}\``;
+              if (!record.prompt.includes(raw)) continue;
+              message.text = message.text.replace(raw, url);
+              const start = message.text.indexOf(url);
+              message.inlineCode = [{ start, end: start + url.length }];
+            }
+            const start = message.text.indexOf(url);
+            const label = alteration === 'prefix' ? 'https://source.example' : url;
+            message.links = [{ start, end: start + label.length,
+              href: alteration === 'href' ? url + '#changed' : new URL(label).href }];
+          }
+          if (alteration === 'body') message.text = message.text.replace('/path', '/other').replace('/part_', '/other_');
+          if (display === 'wrapper' && alteration === 'prefix') {
+            const prefix = 'https://source.example';
+            message.text = record.prompt.replace(url, `[${prefix}](${prefix})${url.slice(prefix.length)}`);
+          }
+          if (['none', 'prefix'].includes(alteration)) assert.equal((await reviews.collect(record.id, 0)).state, 'completed');
+          else await assert.rejects(reviews.collect(record.id, 0), { code: 'review_content_mismatch' });
+        }
+      }
+    }
+  }
+});
+
+test('link ranges inside code preserve all remaining source characters', async () => {
+  for (const raw of ['https://source.example/rules)', '`https://source.example/path.`',
+    '`https://source.example/path?`', '`https://source.example/(path))`', '``https://source.example/a`b``',
+    'https://source.example/a`b']) {
+    const code = raw.startsWith('`');
+    const width = code ? raw.match(/^`+/)[0].length : 0;
+    const url = width ? raw.slice(width, -width) : raw;
+    for (const shortened of [false, true]) {
+      const { reviews, record, view } = await context(`Review ${raw} now.`);
+      const message = view.messages[0];
+      message.text = width ? record.prompt.replace(raw, url) : record.prompt;
+      const start = message.text.indexOf(url);
+      if (width) message.inlineCode = [{ start, end: start + url.length }];
+      const label = shortened ? url.slice(0, -1) : url;
+      message.links = [{ start, end: start + label.length, href: new URL(label).href }];
+      const completed = await reviews.collect(record.id, 0);
+      assert.equal(completed.state, 'completed');
+      message.text = message.text.slice(0, start + label.length) + 'changed' + message.text.slice(start + label.length);
+      assert.throws(() => reviews.assertPrevious(completed, view), { code: 'review_content_mismatch' });
+    }
+  }
+});
+
+test('autolink ranges preserve adjacent source text and cannot insert an empty link', async () => {
   const url = 'https://example.com/docs?x=1#section';
   for (const prefix of ['https://example.com', 'https://example.com/docs', 'https://example.com/docs?x=1', '']) {
     const { reviews, record, view } = await context('See ' + url + ' original source');
     view.messages[0].text = record.prompt.replace(url, `[${prefix}](${prefix})${url.slice(prefix.length)}`);
-    await assert.rejects(reviews.collect(record.id, 0), { code: 'review_content_mismatch' });
+    if (prefix) assert.equal((await reviews.collect(record.id, 0)).state, 'completed');
+    else await assert.rejects(reviews.collect(record.id, 0), { code: 'review_content_mismatch' });
+  }
+});
+
+test('literal backticks and URL punctuation survive different editor link ranges', async () => {
+  for (const url of ['https://source.example/path.', 'https://source.example/path?', 'https://source.example/path)']) {
+    for (const shortened of [false, true]) {
+      const { reviews, record, view } = await context(`Review \`${url}\` now.`);
+      const message = view.messages[0];
+      message.text = record.prompt;
+      const start = message.text.indexOf(url), label = shortened ? url.slice(0, -1) : url;
+      message.links = [{ start, end: start + label.length, href: new URL(label).href }];
+      assert.equal((await reviews.collect(record.id, 0)).state, 'completed');
+    }
   }
 });
 

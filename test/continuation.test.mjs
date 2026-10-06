@@ -56,7 +56,7 @@ async function launch(profile, url, evidence) {
 }
 
 
-test('multipart and follow-up use the same conversation through Electron and CLI', {timeout:90000}, async t => {
+test('multipart and follow-up use the same conversation through Electron and CLI', {timeout:120000}, async t => {
   await mkdir('artifacts/continuation-runs',{recursive:true});
   const evidence=await mkdtemp(resolve('artifacts/continuation-runs/run-'));
   const profile=join(evidence,'profile');

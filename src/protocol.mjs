@@ -11,10 +11,11 @@ export class RelayError extends Error {
 }
 
 const attributeTargetSchema = z.strictObject({
-  attribute: z.enum(['id', 'data-testid', 'name', 'type', 'href', 'data-message-id', 'data-message-author-role', 'data-composer-markdown', 'data-chatgpt-composer', 'data-composer-placement', 'data-app-action-sidebar-project-id', 'data-codex-intelligence-trigger', 'data-model-picker-view-toggle', 'data-map-composer-conversation', 'data-reasoning-slider', 'data-model-picker-view']),
+  attribute: z.enum(['id', 'data-testid', 'name', 'type', 'href', 'data-message-id', 'data-message-author-role', 'data-composer-markdown', 'data-chatgpt-composer', 'data-composer-placement', 'data-app-action-sidebar-project-id', 'data-codex-intelligence-trigger', 'data-model-picker-view-toggle', 'data-map-composer-conversation', 'data-app-shell-active-page', 'data-reasoning-slider', 'data-model-picker-view']),
   value: z.string(),
 });
-export const targetSchema = attributeTargetSchema.extend({ scope: attributeTargetSchema.optional() });
+const scopeSchema = attributeTargetSchema.extend({ scope: attributeTargetSchema.optional() });
+export const targetSchema = attributeTargetSchema.extend({ scope: scopeSchema.optional() });
 const located = { documentId: z.uuid(), target: targetSchema };
 export const partSchema = z.strictObject({ index: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER), total: z.number().int().min(2).max(Number.MAX_SAFE_INTEGER) })
   .refine(part => part.index <= part.total, 'Part index must not exceed total.');

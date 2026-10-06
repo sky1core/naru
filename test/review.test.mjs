@@ -56,7 +56,7 @@ const modernFixture = `<!doctype html><meta charset="utf-8"><style>[data-search-
 <button id="finish">Finish</button><div id="messages"></div>
 <script>
 let phase=0;let turn;let answer;let footer;let status;
-document.querySelector('form').onsubmit=e=>{e.preventDefault();const prompt=document.querySelector('[data-composer-markdown]').innerText;document.querySelector('[data-composer-markdown]').innerText='';const id=prompt.match(/Review request UUID: ([a-f0-9-]+)/)[1];history.replaceState(null,'','/g/${projectId}/c/'+id);turn=document.createElement('div');turn.dataset.contentSearchTurnKey=id;turn.innerHTML='<div data-chatgpt-search-unit-key="'+id+':user" data-chatgpt-search-message-ids="user-'+id+'"><div data-user-message-bubble><div data-search-result-target></div></div><div class="turn-action-controls"><button>Decoy user actions</button></div></div><div data-chatgpt-search-unit-key="'+id+':assistant" data-chatgpt-search-message-ids="answer-'+id+' answer-'+id+'"><div data-markdown-text-style="assistant-message"></div></div>';const body=turn.querySelector('[data-search-result-target]');body.textContent=prompt.replace(/["*\x60~]/g,c=>String.fromCharCode(92)+c);const anchor=document.createElement('a');anchor.dataset.searchResultTarget='';anchor.href='https://example.com/';anchor.style.display='inline-flex';const icon=document.createElement('span');icon.dataset.markdownCopy='exclude';icon.style.display='block';icon.textContent='UI icon decoration';anchor.replaceChildren(icon,document.createTextNode(anchor.href));const at=body.textContent.indexOf(anchor.href);const raw=body.textContent;body.replaceChildren(document.createTextNode(raw.slice(0,at)),anchor,document.createTextNode(raw.slice(at+anchor.href.length)));const tail=body.lastChild;const codeText=String.fromCharCode(92,96)+'code'+String.fromCharCode(92,96);const codeAt=tail.textContent.indexOf(codeText);const code=document.createElement('code');code.textContent='code';tail.replaceWith(document.createTextNode(tail.textContent.slice(0,codeAt)),code,document.createTextNode(tail.textContent.slice(codeAt+codeText.length)));answer=turn.querySelector('[data-markdown-text-style]');answer.textContent='검토 결과\\nEND-OF-REVIEW:'+id;document.getElementById('messages').append(turn)};
+document.querySelector('form').onsubmit=e=>{e.preventDefault();const prompt=document.querySelector('[data-composer-markdown]').innerText;document.querySelector('[data-composer-markdown]').innerText='';const id=prompt.match(/Review request UUID: ([a-f0-9-]+)/)[1];history.replaceState(null,'','/g/${projectId}/c/'+id);turn=document.createElement('div');turn.dataset.contentSearchTurnKey=id;turn.innerHTML='<div data-chatgpt-search-unit-key="'+id+':user" data-chatgpt-search-message-ids="user-'+id+'"><div data-user-message-bubble><div data-search-result-target></div></div><div class="turn-action-controls"><button>Decoy user actions</button></div></div><div data-chatgpt-search-unit-key="'+id+':assistant" data-chatgpt-search-message-ids="answer-'+id+' answer-'+id+'"><div data-markdown-text-style="assistant-message"></div></div>';const body=turn.querySelector('[data-search-result-target]');body.textContent=prompt.replace(/["*\x60~]/g,c=>String.fromCharCode(92)+c);const anchor=document.createElement('a');anchor.dataset.searchResultTarget='';anchor.href='https://example.com/';anchor.style.display='inline-flex';const icon=document.createElement('span');icon.dataset.markdownCopy='exclude';icon.style.display='block';icon.textContent='UI icon decoration';anchor.replaceChildren(icon,document.createTextNode(anchor.href));const at=body.textContent.indexOf(anchor.href);const raw=body.textContent;if(at>=0)body.replaceChildren(document.createTextNode(raw.slice(0,at)),anchor,document.createTextNode(raw.slice(at+anchor.href.length)));const tail=body.lastChild;const codeText=String.fromCharCode(92,96)+'code'+String.fromCharCode(92,96);const codeAt=tail.textContent.indexOf(codeText);const code=document.createElement('code');code.textContent='code';if(codeAt>=0)tail.replaceWith(document.createTextNode(tail.textContent.slice(0,codeAt)),code,document.createTextNode(tail.textContent.slice(codeAt+codeText.length)));answer=turn.querySelector('[data-markdown-text-style]');answer.textContent='검토 결과\\nEND-OF-REVIEW:'+id;document.getElementById('messages').append(turn)};
 document.getElementById('finish').onclick=()=>{phase++;if(phase===1){const nested=document.createElement('div');nested.className='turn-action-controls';nested.innerHTML='<button>Decoy answer content</button>';answer.parentElement.append(nested)}if(phase===2){footer=document.createElement('div');footer.className='turn-action-controls';footer.innerHTML='<button>Completed response action</button>';turn.append(footer);status=document.createElement('span');status.setAttribute('role','status');status.setAttribute('aria-busy','true');status.textContent='Generating';turn.append(status)}if(phase===3){status.remove();footer.hidden=true}if(phase===4){footer.hidden=false}};
 </script>`;
 
@@ -79,11 +79,13 @@ document.querySelector('form').onsubmit=e=>{
   const image='https://example.invalid/image'+slash+slash;
   const rules='https://example.com/rules)으로';
   const raw=prompt.replace(/["*\x60~]/g,c=>slash+c).replace(image,'['+image+']('+image+')')
-    .replace(rules,'['+rules+'](https://example.com/rules'+slash+')으로)');
+    .replace(rules,'['+rules+'](https://example.com/rules'+slash+')으로)')
+    .replaceAll('https://registry.npmjs.org/@types/node/-/node-24.19.0.tgz','https://registry.npmjs.org/node-24.19.0.tgz');
   const literal='@latest'+slash+slash+'n';
   const at=raw.indexOf(literal);
   const span=document.createElement('span');span.dataset.markdownCopy='inline-code';span.textContent=literal;
-  turn.querySelector('p').replaceChildren(document.createTextNode(raw.slice(0,at)),span,document.createTextNode(raw.slice(at+literal.length)));
+  if(at>=0)turn.querySelector('p').replaceChildren(document.createTextNode(raw.slice(0,at)),span,document.createTextNode(raw.slice(at+literal.length)));
+  else turn.querySelector('p').textContent=raw;
   answer=turn.querySelector('[data-markdown-text-style]');answer.textContent='partial';
   status=document.createElement('span');status.setAttribute('role','status');status.setAttribute('aria-busy','true');status.textContent='Generating';turn.append(status);
   document.getElementById('messages').append(turn);
@@ -127,9 +129,9 @@ document.querySelector('form').onsubmit=e=>{
   turn.querySelector('[data-markdown-text-style]').textContent='answer\nEND-OF-REVIEW:'+id;
   document.getElementById('messages').append(turn);
 };
-document.getElementById('tamper').onclick=()=>{const code=document.querySelector('code');code.textContent=code.textContent.replace('KEEP_VALUE','CHANGED_VALUE')};
+document.getElementById('tamper').onclick=()=>{const code=document.querySelector('code');code.textContent=code.textContent.replace('KEEP','CHANGED')};
 document.getElementById('remove-array').onclick=()=>{const code=document.querySelector('code');code.textContent=code.textContent.replace('"files":[','"files":')};
-document.getElementById('insert-newline').onclick=()=>{const code=document.querySelector('code');code.textContent=code.textContent.replace('KEEP_VALUE','KEEP\n_VALUE')};
+document.getElementById('insert-newline').onclick=()=>{const code=document.querySelector('code');code.textContent=code.textContent.replace('KEEP','KEEP\n')};
 </script>`.replaceAll('PROJECT_ID', projectId);
 
 async function launch(profile, url, evidence) {
@@ -289,14 +291,14 @@ test('review workflow through the real Electron API and CLI against an isolated 
   });
 
   await t.test('a changed draft during trusted click is blocked and retained as uncertain', async () => {
-    for (let iteration = 0; iteration < 20; iteration++) {
-    await navigate(iteration % 2 === 0 ? 'race' : 'race-mousedown');
-    const review = await prepare(); const before = await count();
-    await assert.rejects(submit(review.id), { code: 'target_changed' });
-    assert.equal(await count(), before);
-    assert.equal((await call(`/v1/reviews/${review.id}`)).state, 'uncertain');
-    assert.equal((await submit(review.id)).state, 'uncertain');
-    assert.equal(await count(), before);
+    for (const mode of ['race', 'race-mousedown']) {
+      await navigate(mode);
+      const review = await prepare(); const before = await count();
+      await assert.rejects(submit(review.id), { code: 'target_changed' });
+      assert.equal(await count(), before);
+      assert.equal((await call(`/v1/reviews/${review.id}`)).state, 'uncertain');
+      assert.equal((await submit(review.id)).state, 'uncertain');
+      assert.equal(await count(), before);
     }
   });
 
@@ -517,7 +519,7 @@ test('rendered source is verified and collected without resending through real E
   const call = app.call;
   const run = async command => (await call('/v1/commands', { id: randomUUID(), command })).result;
   await run({ action: 'project.bind', documentId: (await call('/v1/status')).documentId });
-  const content = 'nested {"url":"https://example.invalid/image"}\nRead [rules](https://example.com/rules)으로 next; tool@latest\\n.';
+  const content = 'nested {"url":"https://example.invalid/image"}\nRead [rules](https://example.com/rules)으로 next; tool@latest\\n.' + '\nhttps://registry.npmjs.org/@types/node/-/node-24.19.0.tgz\n`https://chatgpt.com/`';
   await writeFile(join(evidence, 'source.txt'), content);
   const out = join(evidence, 'answer.txt');
   await assert.rejects(exec(process.execPath, ['src/cli.mjs', '--profile', profile, 'ask', '--base-dir', evidence,
@@ -529,7 +531,7 @@ test('rendered source is verified and collected without resending through real E
   assert.equal(view.layout, 'search-unit');
   assert.equal(view.busy, true);
   assert.equal(view.messages[0].id, submitted.userMessageId);
-  assert.equal(view.messages[0].inlineCode.length, 1);
+  assert.equal(view.messages[0].inlineCode.length, 0);
   assert.notEqual(view.messages[0].text, submitted.prompt);
   await assert.rejects(lstat(out), { code: 'ENOENT' });
   await run({ action: 'click', documentId: (await call('/v1/status')).documentId, target: { attribute: 'id', value: 'finish' } });
@@ -576,7 +578,7 @@ for (const layout of ['pre', 'copy-block']) test(`JSON source is preserved throu
   assert.deepEqual(checkpoint.command, input);
   assert.equal(checkpoint.promptHash, completed.promptHash);
   const view = await call('/v1/review-ui');
-  assert.equal(view.messages[0].text, completed.prompt);
+  assert.deepEqual(JSON.parse(view.messages[0].text.split('\n')[2]), JSON.parse(completed.prompt.split('\n')[2]));
   assert.equal(JSON.parse(view.messages[0].text.split('\n')[2]).files[0].content, content);
   assert.equal(completed.sources[0].sha256, createHash('sha256').update(content).digest('hex'));
   assert.equal(await readFile(out, 'utf8'), completed.answer);

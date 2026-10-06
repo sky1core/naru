@@ -1,7 +1,7 @@
 import { constants } from 'node:fs';
-import { lstat, realpath, open, link, unlink } from 'node:fs/promises';
-import { resolve, relative, isAbsolute, join, dirname, sep, posix, win32 } from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { lstat, realpath, open } from 'node:fs/promises';
+import { resolve, relative, isAbsolute, join, sep, posix, win32 } from 'node:path';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { RelayError, partSchema, continuationSchema, validPartLink } from './protocol.mjs';
 
@@ -101,9 +101,12 @@ async function readInput(record) {
   }
 }
 
-export async function loadReviewFiles(paths, { baseDir = process.cwd() } = {}) {
+export async function loadReviewFiles(paths, { baseDir = process.cwd(), maxBytes } = {}) {
   if (!Array.isArray(paths) || paths.some((path) => !validPath(path)) || !validPath(baseDir)) {
     fail('review_file_invalid_path', 'Review inputs must be an array of explicit file paths with a valid base directory.', 400);
+  }
+  if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
+    fail('review_file_invalid_budget', 'Review input byte budget must be a nonnegative safe integer.', 400);
   }
   try {
     const base = resolve(baseDir);
@@ -111,6 +114,7 @@ export async function loadReviewFiles(paths, { baseDir = process.cwd() } = {}) {
     const files = [];
     const records = [];
     const identities = new Set();
+    let remainingBytes = maxBytes;
     for (const path of paths) {
       const display = relative(base, resolve(base, path));
       if (isAbsolute(display) || display === '..' || display.startsWith(`..${sep}`)) {
@@ -124,7 +128,11 @@ export async function loadReviewFiles(paths, { baseDir = process.cwd() } = {}) {
       const identity = `${record.metadata.dev}:${record.metadata.ino}`;
       if (identities.has(identity)) fail('review_file_duplicate', 'The same review input file was listed more than once.', 400);
       identities.add(identity);
+      if (remainingBytes !== undefined && record.metadata.size > BigInt(remainingBytes)) {
+        fail('body_too_large', 'Review input exceeds the 8 MiB API request limit. No source was truncated or sent.', 413);
+      }
       files.push({ path: display.split(sep).join('/'), ...await readInput(record) });
+      if (remainingBytes !== undefined) remainingBytes -= files.at(-1).bytes;
       records.push(record);
     }
     for (const record of records) await verifyInput(record);
@@ -166,6 +174,15 @@ export function composeReviewPrompt(input = {}) {
   ].join('\n');
 }
 
+export function escapeReviewJSON(prompt) {
+  const start = prompt.indexOf('\n{"id":') + 1;
+  const end = prompt.indexOf('\n', start);
+  if (!start || end === -1) fail('review_prompt_invalid', 'Review prompt must contain its complete JSON payload.', 400);
+  const payload = prompt.slice(start, end).replace(/"(?:\\.|[^"\\])*"/g, token =>
+    token.replace(/[&`@/*_.:\[\]<>]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`));
+  return `${prompt.slice(0, start)}${payload}${prompt.slice(end)}`;
+}
+
 export function encodeReviewPrompt(prompt) {
   const start = prompt.indexOf('\n{"id":') + 1;
   const end = prompt.indexOf('\n', start);
@@ -181,44 +198,6 @@ export async function writeReviewOutput(path, text) {
   if (!validPath(path) || typeof text !== 'string' || !text.isWellFormed()) {
     fail('review_output_invalid', 'Review output requires a file path and valid UTF-8 text.', 400);
   }
-  const output = resolve(path);
-  const directory = dirname(output);
-  const temporary = join(directory, `.review-${randomUUID()}.tmp`);
-  let file;
-  let directoryHandle;
-  let ownedTemporary = false;
-  let publishing = false;
-  let failure;
-  try {
-    directoryHandle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
-    file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-    ownedTemporary = true;
-    await file.chmod(0o600);
-    await file.writeFile(text, 'utf8');
-    await file.sync();
-    await file.close();
-    file = undefined;
-    publishing = true;
-    await link(temporary, output);
-    publishing = false;
-    await unlink(temporary);
-    ownedTemporary = false;
-    await directoryHandle.sync();
-  } catch (error) {
-    failure = new RelayError(
-      publishing && error.code === 'EEXIST' ? 'review_output_exists' : 'review_output_write_failed',
-      publishing && error.code === 'EEXIST' ? 'Review output already exists; it was not overwritten.' : 'Unable to publish and synchronize review output.',
-    );
-  } finally {
-    for (const cleanup of [
-      async () => { if (file) await file.close(); },
-      async () => { if (ownedTemporary) await unlink(temporary); },
-      async () => { if (directoryHandle) await directoryHandle.close(); },
-    ]) {
-      try { await cleanup(); }
-      catch { failure ??= new RelayError('review_output_write_failed', 'Unable to clean up or close review output resources.'); }
-    }
-  }
-  if (failure) throw failure;
-  return output;
+  const { publishReviewOutput } = await import('./output-writer.mjs');
+  return publishReviewOutput(resolve(path), text);
 }

@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { Journal } from './journal.mjs';
 import { Reviews } from './review.mjs';
 import { RelayError, publicError, requestSchema, maxRequestBytes } from './protocol.mjs';
+import { identityProof, validIdentityNonce } from './server-identity.mjs';
 
 async function readJSON(request) {
   let bytes = 0;
@@ -37,9 +38,16 @@ export async function startServer({ browser, profile, quit }) {
 
   const server = createServer(async (request, response) => {
     try {
+      if (request.headers.host !== `127.0.0.1:${port}` || request.headers.origin !== undefined) {
+        throw new RelayError('unauthorized', 'Local host is required; browser-origin requests are denied.', 401);
+      }
+      if (request.method === 'GET' && request.url === '/v1/identity') {
+        const nonce = request.headers['x-naru-nonce'];
+        if (!validIdentityNonce(nonce)) throw new RelayError('invalid_identity_nonce', 'Expected a 32-byte hexadecimal identity nonce.', 400);
+        return reply(response, 200, { nonce, proof: identityProof(token, nonce, request.socket.remotePort, request.socket.localPort) });
+      }
       const authorization = Buffer.from(request.headers.authorization || '');
-      if (request.headers.host !== `127.0.0.1:${port}` || request.headers.origin !== undefined ||
-        authorization.length !== expectedAuthorization.length || !timingSafeEqual(authorization, expectedAuthorization)) {
+      if (authorization.length !== expectedAuthorization.length || !timingSafeEqual(authorization, expectedAuthorization)) {
         throw new RelayError('unauthorized', 'Local bearer authentication is required; browser-origin requests are denied.', 401);
       }
       if (request.method === 'GET' && request.url === '/v1/status') return reply(response, 200, {
@@ -113,7 +121,8 @@ export async function startServer({ browser, profile, quit }) {
       });
       const outcome = await Promise.race([execution, deadline]);
       clearTimeout(timer);
-      recordReply(response, journal.finish(record, outcome));
+      const reviewId = ['review.prepare', 'review.submit', 'review.collect'].includes(command.action) ? command.reviewId : undefined;
+      recordReply(response, journal.finish(record, outcome, { reviewId }));
     } catch (error) {
       if (!(error instanceof RelayError)) console.error(error);
       if (!response.headersSent) reply(response, error.status || 500, { error: publicError(error) });
