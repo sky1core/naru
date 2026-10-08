@@ -45,6 +45,8 @@ async function mainFixture(profile, mainURL, serverURL, scenario) {
       });
     }
     static fromWebContents(contents) { return contents === window.webContents ? window : null; }
+    showInactive() {}
+    blur() {}
     isDestroyed() { return false; }
     async loadURL(url) { assert.equal(url, secretURL); throw failure; }
   }

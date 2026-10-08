@@ -54,7 +54,9 @@ if (values.help) {
     app.whenReady().then(async () => {
     const preferences = { sandbox: true, contextIsolation: true, nodeIntegration: false, nodeIntegrationInSubFrames: true, webSecurity: true, backgroundThrottling: false,
       preload: fileURLToPath(new URL('./input-guard.cjs', import.meta.url)) };
-    const window = new BrowserWindow({ width: 1180, height: 820, title: 'Naru', webPreferences: preferences });
+    const window = new BrowserWindow({ show: false, width: 1180, height: 820, title: 'Naru', webPreferences: preferences });
+    window.showInactive();
+    window.blur();
     const browser = new Browser(window);
     ipcMain.on('chatgpt-relay-frame-guard', (event, type, token) => {
       event.returnValue = browser.guardFrame(event.sender, event.senderFrame, type, token);

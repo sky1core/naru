@@ -2,14 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
-import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import electron from 'electron';
+import { spawnElectron } from './electron.mjs';
 
 test('renderer boundaries preserve attachments, drafts and link identities', { timeout: 100000 }, async t => {
   await mkdir('artifacts/boundary-runs', { recursive: true });
   const root = await mkdtemp(resolve('artifacts/boundary-runs/run-'));
-  const child = spawn(electron, [resolve('test/fixtures/browser-boundaries.mjs'), root], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnElectron([resolve('test/fixtures/browser-boundaries.mjs'), root], { stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '', stderr = '';
   child.stdout.on('data', chunk => { stdout += chunk; });
   child.stderr.on('data', chunk => { stderr += chunk; });

@@ -43,10 +43,12 @@ app.whenReady().then(async () => {
   const origin = `http://127.0.0.1:${server.address().port}`, projectId = 'g-p-0123456789abcdef0123456789abcdef';
   const project = { version: 1, id: projectId, origin, url: `${origin}/g/${projectId}/project` };
   writePrivateJSON(join(profile, 'project.json'), project);
-  const window = new BrowserWindow({ width: 1000, height: 700, webPreferences: {
+  const window = new BrowserWindow({ show: false, width: 1000, height: 700, webPreferences: {
     sandbox: true, contextIsolation: true, nodeIntegration: false, nodeIntegrationInSubFrames: true, webSecurity: true,
     preload: new URL('../../src/input-guard.cjs', import.meta.url).pathname,
   } });
+  window.showInactive();
+  window.blur();
   const browser = new Browser(window);
   activeBrowser = browser;
   ipcMain.on('chatgpt-relay-frame-guard', (event, type, token) => { event.returnValue = browser.guardFrame(event.sender, event.senderFrame, type, token); });

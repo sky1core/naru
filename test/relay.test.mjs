@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, get } from 'node:http';
-import { spawn, execFile } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, writeFile, stat } from 'node:fs/promises';
@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createWriteStream } from 'node:fs';
-import electron from 'electron';
+import { spawnElectron } from './electron.mjs';
 import { connect } from '../src/client.mjs';
 import { Journal } from '../src/journal.mjs';
 
@@ -63,7 +63,7 @@ moving.onpointerdown = () => { const rect = moving.getBoundingClientRect(); cons
 </script>`;
 
 async function launch(profile, url, evidence, entry = '.') {
-  const child = spawn(electron, [entry, '--profile', profile, '--url', url], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnElectron([entry, '--profile', profile, '--url', url], { stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   let errors = '';
   const log = createWriteStream(join(evidence, `electron-${child.pid}.log`));
@@ -440,7 +440,7 @@ test('pointer activation can complete without a synthesized click', async () => 
   }
 });
 
-test('background input and review collection keep another window focused', { timeout: 20000 }, async () => {
+test('startup, background input and review collection do not focus the window', { timeout: 20000 }, async () => {
   await mkdir('artifacts/test-runs', { recursive: true });
   const evidence = await mkdtemp(resolve('artifacts/test-runs/background-'));
   const profile = join(evidence, 'profile');
@@ -471,23 +471,17 @@ document.querySelector('form').onsubmit=e=>{
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const entry = join(evidence, 'background.mjs');
-  await writeFile(entry, `import { app, BrowserWindow } from 'electron';
+  await writeFile(entry, `import { app } from 'electron';
 import { writeFileSync, renameSync } from 'node:fs';
 app.once('browser-window-created', (_event, primary) => {
-  let other, focuses = 0;
+  let focuses = 0;
   const record = () => {
-    writeFileSync(${JSON.stringify(focusPath + '.tmp')}, JSON.stringify({ focuses, otherFocused: other !== undefined && !other.isDestroyed() && other.isFocused(), primaryFocused: !primary.isDestroyed() && primary.isFocused() }));
+    writeFileSync(${JSON.stringify(focusPath + '.tmp')}, JSON.stringify({ focuses, focused: !primary.isDestroyed() && primary.isFocused(), visible: !primary.isDestroyed() && primary.isVisible() }));
     renameSync(${JSON.stringify(focusPath + '.tmp')}, ${JSON.stringify(focusPath)});
   };
   primary.on('focus', () => { focuses++; record(); });
   primary.on('blur', record);
-  primary.once('ready-to-show', async () => {
-    other = new BrowserWindow({ show: false, width: 1300, height: 1000 });
-    other.on('focus', record);
-    other.on('blur', record);
-    await other.loadURL('data:text/html,<textarea autofocus>Other work</textarea>');
-    other.show(); other.focus();
-  });
+  primary.once('ready-to-show', record);
 });
 await import(${JSON.stringify(new URL('../src/main.mjs', import.meta.url).href)});
 `);
@@ -500,11 +494,12 @@ await import(${JSON.stringify(new URL('../src/main.mjs', import.meta.url).href)}
     do {
       try { focus = JSON.parse(await readFile(focusPath, 'utf8')); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
-      if (focus?.otherFocused && !focus.primaryFocused) break;
+      if (focus?.visible) break;
       await delay(20);
     } while (Date.now() < deadline);
-    assert.equal(focus?.otherFocused, true);
-    assert.equal(focus.primaryFocused, false);
+    assert.equal(focus?.visible, true);
+    assert.equal(focus.focuses, 0);
+    assert.equal(focus.focused, false);
     let duplicate;
     try {
       await assert.rejects(async () => { duplicate = await launch(profile, url, evidence); }, /Electron exited 1\n[\s\S]*Naru is already running\./);
@@ -522,8 +517,8 @@ await import(${JSON.stringify(new URL('../src/main.mjs', import.meta.url).href)}
     assert.equal((await current('read', 'key')).text, 'Enter:true');
     const after = JSON.parse(await readFile(focusPath, 'utf8'));
     assert.equal(after.focuses, focus.focuses);
-    assert.equal(after.otherFocused, true);
-    assert.equal(after.primaryFocused, false);
+    assert.equal(after.visible, true);
+    assert.equal(after.focused, false);
   } finally {
     if (running) await running.stop();
     await new Promise(done => server.close(done));

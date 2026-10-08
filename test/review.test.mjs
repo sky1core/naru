@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { spawn, execFile } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, writeFile, readFile, lstat } from 'node:fs/promises';
@@ -9,7 +9,7 @@ import { createWriteStream } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import electron from 'electron';
+import { spawnElectron } from './electron.mjs';
 import { connect } from '../src/client.mjs';
 
 const exec = promisify(execFile);
@@ -135,7 +135,7 @@ document.getElementById('insert-newline').onclick=()=>{const code=document.query
 </script>`.replaceAll('PROJECT_ID', projectId);
 
 async function launch(profile, url, evidence) {
-  const child = spawn(electron, ['.', '--profile', profile, ...(url === undefined ? [] : ['--url', url])], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnElectron(['.', '--profile', profile, ...(url === undefined ? [] : ['--url', url])], { stdio: ['ignore', 'pipe', 'pipe'] });
   const log = createWriteStream(join(evidence, `electron-${child.pid}.log`));
   child.stdout.pipe(log, { end: false }); child.stderr.pipe(log, { end: false });
   const closed = once(child, 'close'); closed.then(() => log.end());

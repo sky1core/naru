@@ -32,9 +32,11 @@ app.whenReady().then(async () => {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const origin = `http://127.0.0.1:${server.address().port}`, home = `${origin}/g/${projectId}/project`;
-  const window = new BrowserWindow({ width: 1000, height: 700, webPreferences: {
+  const window = new BrowserWindow({ show: false, width: 1000, height: 700, webPreferences: {
     sandbox: true, contextIsolation: true, nodeIntegration: false, webSecurity: true,
   } });
+  window.showInactive();
+  window.blur();
   const browser = new Browser(window);
   const api = await startServer({ browser, profile, quit: () => app.quit() });
   writePrivateJSON(join(profile, 'connection.json'), api.descriptor);

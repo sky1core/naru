@@ -2,9 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
-import { spawn } from 'node:child_process';
 import { once, EventEmitter } from 'node:events';
-import electron from 'electron';
+import { spawnElectron } from './electron.mjs';
 import { Browser } from '../src/browser.mjs';
 
 test('review navigation requires a full document load after an in-page event', async () => {
@@ -41,7 +40,7 @@ test('review navigation requires a full document load after an in-page event', a
 test('protected project navigation loads new documents for saved fragments and queries', { timeout: 45000 }, async t => {
   await mkdir('artifacts/navigation-runs', { recursive: true });
   const root = await mkdtemp(resolve('artifacts/navigation-runs/run-'));
-  const child = spawn(electron, [resolve('test/fixtures/navigation-fragment.mjs'), root], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnElectron([resolve('test/fixtures/navigation-fragment.mjs'), root], { stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '', stderr = '';
   child.stdout.on('data', chunk => { stdout += chunk; });
   child.stderr.on('data', chunk => { stderr += chunk; });
