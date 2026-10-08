@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron .",
     "naru": "node src/cli.mjs",
-    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "test": "node scripts/test.mjs",
     "check": "node scripts/check.mjs"
   },
   "engines": { "node": ">=22.12.0" },
